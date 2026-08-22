@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+
+# Local environments and artifacts
+.venv/
+venv/
+artifacts/
+
+# Training outputs
+checkpoints/
+outputs/
+runs/
+wandb/
+
+# Local secrets
+.env
+*.token
