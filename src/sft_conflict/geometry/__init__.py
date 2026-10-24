@@ -1,0 +1,61 @@
+"""Pure PyTorch geometry primitives and correctness oracles."""
+
+from .lvd import (
+    LVDPressureResult,
+    PressureResponse,
+    PressureSpectrumStatistics,
+    capacity_weights,
+    chunked_lvd_pressure_loss,
+    distributed_second_moment_frobenius_loss,
+    distributed_second_moment_frobenius_loss_and_global_pressure,
+    four_segment_pressure_response,
+    pressure_response,
+    pressure_spectrum_statistics,
+    second_moment_frobenius_loss,
+    select_lvd_competitors,
+    three_segment_pressure_response,
+    weighted_lvd_pressure_loss,
+)
+from .lvd_plus import (
+    LVDPlusPressureResult,
+    LVDPlusResponse,
+    chunked_lvd_plus_pressure,
+    lvd_plus_pressure_response,
+)
+from .oracles import (
+    LaguerreOracleAudit,
+    LVDPartitionAudit,
+    audit_laguerre_oracle,
+    audit_lvd_partition,
+    laguerre_power_distances,
+    linear_logits,
+    pairwise_signed_distance,
+)
+
+__all__ = [
+    "LVDPlusPressureResult",
+    "LVDPlusResponse",
+    "chunked_lvd_plus_pressure",
+    "lvd_plus_pressure_response",
+    "LVDPressureResult",
+    "PressureSpectrumStatistics",
+    "PressureResponse",
+    "capacity_weights",
+    "chunked_lvd_pressure_loss",
+    "distributed_second_moment_frobenius_loss",
+    "distributed_second_moment_frobenius_loss_and_global_pressure",
+    "four_segment_pressure_response",
+    "pressure_response",
+    "pressure_spectrum_statistics",
+    "select_lvd_competitors",
+    "second_moment_frobenius_loss",
+    "three_segment_pressure_response",
+    "weighted_lvd_pressure_loss",
+    "LVDPartitionAudit",
+    "LaguerreOracleAudit",
+    "audit_laguerre_oracle",
+    "audit_lvd_partition",
+    "laguerre_power_distances",
+    "linear_logits",
+    "pairwise_signed_distance",
+]

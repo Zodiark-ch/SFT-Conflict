@@ -1,0 +1,60 @@
+model:
+  model_id: mistralai/Mistral-7B-v0.3
+  revision: caa1feb0e54d415e2df31207e5f4e273e33509b1
+  model_variant: base
+  training_mode: lora
+  freeze_unembedding: true
+  untie_tied_embeddings: false
+  local_files_only: true
+  gradient_checkpointing: true
+
+lora:
+  rank: 8
+  alpha: 32
+  dropout: 0.05
+  bias: none
+  target_modules: [q_proj, v_proj]
+
+data:
+  target:
+    source: hf
+    path: openai/gsm8k
+    name: main
+    split: train
+    revision: 740312add88f781978c0658806c59bc2815b9866
+    adapter: gsm8k
+    max_samples: 256
+  max_length: 512
+  target_batch_size: 1
+  anchor_batch_size: 1
+  anchor_batches_per_target: 0.0
+  steps_per_epoch: 20
+
+method:
+  name: target_only
+
+training:
+  mixed_precision: fp32
+  learning_rate: 2.0e-4
+  max_steps: 20
+  gradient_accumulation_steps: 4
+  max_grad_norm: 1.0
+  logging_steps: 1
+  save_strategy: "no"
+  report_to: [tensorboard]
+
+evaluation:
+  target:
+    source: hf
+    path: openai/gsm8k
+    name: main
+    split: test
+    revision: 740312add88f781978c0658806c59bc2815b9866
+    adapter: gsm8k
+    max_samples: 256
+  batch_size: 1
+  run_after_training: true
+
+paths:
+  run_name: mistral-7b-gsm8k-lora-smoke
+  estimated_run_bytes: 42949672960

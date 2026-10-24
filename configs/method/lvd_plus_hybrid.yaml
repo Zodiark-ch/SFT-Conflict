@@ -1,0 +1,36 @@
+# Opt-in LVD+ pressure-plus-boundary-risk objective; formal method is unchanged:
+# target_plus_anchor_lvd+. The launcher must normalize preparation actions.
+# Retains lvd_plus_s0.yaml geometry/calibration defaults and the original gain=1.
+config_version: 1
+anchor_mode: recorded_s0
+# Unresolved until preparation binds the model/revision/solver-specific S0 cache.
+s0_cache_path: null
+s0_cache_sha256: null
+top_k: 512
+position_chunk_size: 4
+exponential_rate: 0.01
+transition_width: 0.01
+exponent_clamp: 6.0
+normal_epsilon: 1.0e-12
+moment_mode: uncentered_second_moment
+lambda_mode: gradient_ratio
+fixed_lambda: null
+resolved_lambda: null
+target_gradient_ratio: 0.0005
+calibration_batches: 64
+calibration_accumulation_steps: 4
+calibration_seed: 20260927
+lambda_warmup_steps: 0
+post_crossing_slope_gain: 1.0
+objective_mode: pressure_plus_risk
+risk_weight: 3.0
+risk_temperature: 1.0
+# Both scales must be positive finite numbers together, or both unresolved.
+resolved_outer_scale: null
+resolved_risk_scale: null
+# Content identities are filled by verified preparation, never by hashing paths.
+# Old pressure-only lambda/calibration artifacts are not hybrid bindings.
+scale_cache_path: null
+scale_cache_sha256: null
+lambda_cache_path: null
+lambda_cache_sha256: null

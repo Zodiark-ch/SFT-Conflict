@@ -33,7 +33,7 @@
 
 真实模型的隐藏维度通常为数千维，词表规模可达数万至十余万。显式枚举并构造全部 Token 胞腔、顶点和邻接关系在计算上不可行，也不是损失计算所必需的。
 
-工程实现应利用 Unembedding 的代数等价性，只计算参考 Token 与 Top-K 竞争 Token 之间的局部决策超平面、法向量和边际。本文中的“平面 LVD”指边界由平直仿射超平面构成，并不表示将隐藏状态降到二维平面后再计算损失。二维投影只用于可视化，不能用于训练损失。
+工程实现应利用 Unembedding 的代数等价性：记录阶段分块计算参考 Token 到词表中每个其他 Token 的边际，训练阶段只为当次随机采样的 K 个竞争 Token gather 权重行和边际。不得构造 $V\times V$ Token 对或完整胞腔。本文中的“平面 LVD”指边界由平直仿射超平面构成，并不表示将隐藏状态降到二维平面后再计算损失。二维投影只用于可视化，不能用于训练损失。
 
 #### B. 在第一阶段预留双数据流和自定义损失接口
 
@@ -70,17 +70,17 @@
 
 实验框架仍需支持真正的全参数微调基线，包括可训练 `lm_head`。但该基线与“冻结 LVD 的主方法”必须使用不同、准确的名称。允许增加“训练 `lm_head`、但损失仍使用冻结 $W_0,b_0$”的消融实验，不能将其默认解释为严格保护当前模型的实时决策胞腔。
 
-#### E. Top-K 近似不能被表述为绝对全词表保证
+#### E. 随机 K 必须能够覆盖整个词表
 
-固定的基座 Top-K 竞争集可能遗漏训练后新出现的危险竞争 Token。主实现应支持三种邻居策略：
+按基座或当前 Logit 选择 Top-K 会持续偏向常见高概率 Token，使大量低频 Token 永远没有机会参与几何约束。主实现固定采用以下协议：
 
-1. `base_topk`：仅使用基座模型 Top-K，速度最快；
-2. `base_current_union`：基座 Top-K 与当前模型 Top-K 的并集，建议作为主实验默认值；
-3. `full_vocab`：只用于小模型、Toy Test 和正确性验证。
+1. `record_anchor_d0` 为每个保留位置记录参考 Token 到全部 $V-1$ 个竞争 Token 的 $d^{(0)}$，按 token ID 索引；
+2. 每次训练访问该位置时，从参考 Token 之外的完整词表中均匀、无放回随机采样 K 个竞争 Token，采样不读取基座或当前 Logit 排名；
+3. K 只属于训练配置，不属于缓存身份，因此同一份全词表 d0 缓存可用于不同 K 的实验。
 
-必须记录 Top-K 对实际翻转竞争 Token 的召回率。只有在全词表检查或召回率证据充分时，才能对“防止胞腔越界”作强结论。
+若同一位置被访问 $T$ 次，任一给定竞争 Token 从未被抽中的概率为 $(1-K/(V-1))^T$。正式实验必须记录随机种子、累计唯一竞争 Token 数及理论期望覆盖率，并用不同 K 做消融。
 
-全词表校验固定在一个版本化的诊断子集上执行：每次正式评测 checkpoint 使用完整当前 Logit 找到真实获胜 Token，计算邻居集合对翻转 Token 的 recall，并报告翻转样本数、样本覆盖率和置信区间。强结论所需的最低 recall 阈值必须在查看正式测试结果前预注册；若未达到阈值，应增大 $K$ 或改用动态并集策略。
+有限次随机采样仍不等价于逐步检查完整词表。全词表校验固定在版本化诊断子集上执行：每次正式评测 checkpoint 使用完整当前 Logit 找到真实获胜 Token，并报告翻转位置数、完整词表 crossing rate、随机样本是否命中真实翻转 Token及置信区间。只有完整词表诊断支持时，才能对“防止胞腔越界”作强结论。
 
 #### F. 两项理论表述需要作为待验证假设，而不是工程先验
 
@@ -122,7 +122,7 @@
 
 ### 2.4 首版最小范围与明确排除项
 
-首版以 Future Localization 微调框架为蓝本，只实现证明核心假设所需的最小闭环：decoder-only Causal LM、Full FT/冻结头主体微调/standard LoRA、目标任务 SFT、SMART 锚定数据消费、参考激活缓存、局部 Top-K LVD、Unified-Cov Loss、任务评测和高维几何诊断。
+首版以 Future Localization 微调框架为蓝本，只实现证明核心假设所需的最小闭环：decoder-only Causal LM、Full FT/冻结头主体微调/standard LoRA、目标任务 SFT、SMART 锚定数据消费、全词表 d0 参考缓存、随机 K LVD、Unified-Cov Loss、任务评测和高维几何诊断。
 
 以下功能暂不进入 MVP：
 
@@ -168,7 +168,7 @@
 
 - 目标任务效果：任务原生指标，如 Accuracy、F1、Exact Match、pass@k、win rate。
 - 通用能力保留：微调前后绝对变化、相对变化和平均保留率。
-- LVD 指标：原始边际、残留边际、安全核心违反率、胞腔 crossing rate、危险竞争 Token 的 Top-K recall。
+- LVD 指标：原始边际、残留边际、安全核心违反率、胞腔 crossing rate、随机竞争 Token 的累计词表覆盖率和完整词表 crossing 诊断。
 - 干扰指标：压强向量模长、总二阶矩、最大特征值、谱有效秩、归一化各向异性。
 - 漂移指标：$\|\Delta h\|_2$ 的均值、分位数和层/Token 分布。
 - 工程指标：每步耗时、吞吐量、峰值显存、checkpoint 大小和额外存储。
@@ -337,11 +337,11 @@ TRANSFORMERS_OFFLINE=1
 | Unembedding/`lm_head` 冻结 | 暴露 `--freeze-unembedding/--no-freeze-unembedding`，默认冻结；真正 Full FT baseline 显式传入 `--no-freeze-unembedding` |
 | tied weights | 按训练模式处理：真正 Full FT 保留原生权重绑定；冻结头且输入 Embedding 可训练时先解耦并只冻结输出头；LoRA 默认保持原生绑定和冻结基座，只有输入 Embedding 将被训练时才解耦。所有行为配置化并记录 |
 | 隐藏状态 | 捕获 final norm 后、实际进入 Unembedding 的张量 |
-| 邻居策略 | 默认 `base_current_union` |
-| Top-K | 默认 32；消融集合为 8、16、32、64 |
+| 邻居策略 | 从参考 Token 之外的完整词表均匀无放回随机采样 |
+| 竞争方向 K | 当前 logits Top-K 默认 512；随机 K 保留为消融；数量可在 run 的 LVD_DIRECTION 修改 |
 | 安全核心 | 默认 $\gamma_0=0.2$ |
 | 压强参数 | 默认 $\mu_3=1$、$\mu_4=2$、$p=1$，指数输入默认 clamp 到 20 |
-| 损失权重 | 先运行 target-only pilot，再将 $\lambda$ 校准到辅助损失梯度范数约为 SFT 梯度范数的 10%；使用固定校准批次和全部共享可训练参数，聚合规则见第三步“统一协方差损失”；最终值写入配置快照 |
+| 损失权重 | 先运行 target-only pilot，再将 $\lambda$ 校准到辅助损失梯度范数约为 SFT 梯度范数的 50%；使用固定校准批次和全部共享可训练参数，聚合规则见第三步“统一协方差损失”；最终值写入配置快照 |
 | 二阶矩形式 | 未中心化二阶矩为主方法；中心化协方差只作消融 |
 
 冻结相关设置全部由命令行/配置解析，至少包括训练模式、Unembedding 冻结和 tied-weight 解耦。程序必须记录最终可训练参数清单；run 名称依据解析后的真实参数状态生成，不能仅依据用户填写的模式名称。
@@ -350,7 +350,7 @@ TRANSFORMERS_OFFLINE=1
 
 | 项目 | 已确认方案 |
 |---|---|
-| Top-K recall | 固定诊断集上至少 95%；不足时增大 K，不能作全词表保护结论 |
+| 随机邻居覆盖 | 报告累计唯一 Token 数及理论期望覆盖率；完整词表诊断不足时不能作全词表保护结论 |
 | Crossing 改善 | 相对 `target_only` 至少降低 20%；若 baseline crossing 为 0，则改用预注册的 safety-core violation/margin erosion 指标 |
 | 目标任务退化上限 | 不超过 1 个绝对百分点或基线指标的 2% 相对值，取较宽者 |
 | 正式随机种子 | 3 个；冒烟阶段 1 个 |
@@ -416,6 +416,9 @@ TRANSFORMERS_OFFLINE=1
 1. 通过 `TrainingArguments`/等价 typed config 支持 gradient accumulation、gradient clipping、学习率调度、warmup 和 weight decay。
 2. 通过 Trainer/Accelerate 支持 1 至 4 张 GPU；使用 1 卡时不启用 DDP/FSDP 包装；0.5B/LoRA 在 2 至 4 卡时默认 DDP，3B/7B Full FT 在 2 至 4 卡时默认 FSDP Full Shard。模型加载阶段不传训练用 `device_map`。
 3. 调用标准 `Trainer.train(resume_from_checkpoint=...)`，checkpoint 必须包含模型/Adapter、optimizer、scheduler、scaler、Trainer state、global step、epoch、双流 sampler/RNG 状态和已解析配置；`eval_checkpoint` 是独立只评测参数。
+	对 flat-parameter FSDP 的块量化 optimizer，允许使用版本化的 rank-local optimizer shard，
+	但必须原子验证所有 rank 文件、绑定 optimizer 类型与 world size，并在配置或 rank 数变化时
+	fail-fast；不得因上游全量 gather 不兼容而静默省略 optimizer state。
 4. 支持目标批次与锚定批次的双流迭代：
 	- 独立 batch size；
 	- 可配置采样比例；
@@ -552,8 +555,8 @@ sample_id
 - `sample_id` 和 token position；
 - $h_{0,n}$；
 - 参考 Token $j_n^*=\arg\max_j z_{0,j}(h_{0,n})$；
-- 基座 Top-K 竞争 Token ID；
-- 基准 Logit 与必要的基准边际；
+- 按 token ID 索引的全部词表基准边际 $d^{(0)}$；
+- 基准参考 Logit；
 - 基座预测置信度、是否与可用 gold label 一致；
 - 模型、Tokenizer、数据和位置采样策略的版本信息。
 
@@ -568,7 +571,7 @@ sample_id
 
 缓存建议使用 Safetensors/Parquet 等结构化分片格式，不保存 Python pickle。必须提供缓存大小估算、完整性校验、断点续生成和按 sample ID 随机读取。缓存不得提交 Git。
 
-参考激活的存储精度必须通过误差预算决定，不能沿用 Geometric Lens 部分导出路径默认将隐藏状态转换为 FP16 的做法。先在校准子集同时生成 FP32 与候选压缩格式缓存，比较 $h_0$ 重构误差、Top-K 一致率、margin 绝对/相对误差、safety-core/crossing 判定翻转率；只有全部低于预注册阈值时才允许正式使用 BF16/FP16，否则保留 FP32 或按样本保存更高精度边际。任何缓存都必须可从模型和数据 revision 重算。
+参考激活的存储精度必须通过误差预算决定，不能沿用 Geometric Lens 部分导出路径默认将隐藏状态转换为 FP16 的做法。先在校准子集同时生成 FP32 与候选压缩格式缓存，比较 $h_0$ 重构误差、argmax 一致率、全词表 margin 绝对/相对误差、safety-core/crossing 判定翻转率；只有全部低于预注册阈值时才允许正式使用 BF16/FP16，否则保留 FP32 或按样本保存更高精度边际。任何缓存都必须可从模型和数据 revision 重算。
 
 ### 5.5 Benchmark 训练组
 
@@ -653,8 +656,10 @@ $$
 3. 对 $d_{n,k}^{(0)}$ 极小的边界单独标记，不可静默 clamp 后与普通样本混合解释；测试必须覆盖近零边际和非整数 $p$。
 4. 支持无 bias 的模型，将 $b_0$ 视为零向量但不实际分配完整词表大小的零张量。
 5. 不生成 $V\times V$ 的 Token 对矩阵，只 gather 当前批次需要的权重行。
-6. 支持 `base_topk`、`base_current_union` 和测试用 `full_vocab` 邻居策略。
-7. 默认使用 `base_current_union` 和 $K=32$；消融运行 $K\in\{8,16,32,64\}$。
+6. 默认按当前 Unembedding logits 排名选择参考 Token 以外的 Top-K，排名 detach；发生 argmax 翻转时必须包含当前赢家。均匀无放回随机采样保留为显式消融。
+7. 默认 $K=512$，由点击入口的 `LVD_DIRECTION` 覆盖；不同 K/排名策略复用同一位置协议的全词表 d0，但必须重新校准 lambda。
+8. 默认动态检查所有有效 response 预测位置，排除 prompt/padding/EOS，并保留 `base_correct` 筛选；切换位置协议需重建 d0，不得静默复用四位置缓存。按位置分块并在 backward 重算，不能通过平均分块 loss 改变全局二阶矩。
+9. 新方法 `target_plus_anchor_ce_lvd` 同时使用 Target CE、`anchor_weight` 加权 Anchor CE 和 lambda 加权 LVD；同一 Anchor batch、单次合并 forward/backward。lambda 校准只比较 LVD 与 Target CE，不混入 Anchor CE。
 
 ### 6.2.1 LVD 代数 oracle 与模型适配验证
 
@@ -680,6 +685,19 @@ $$
 $$
 
 因此最小 Laguerre 距离 Token、最大线性 Logit Token和所有成对边界符号完全一致。
+
+项目必须提供真实模型验证动作。对捕获的每个 Unembedding 输入 $h$，先由 Laguerre power
+argmin 独立确定候选胞腔 $j$，再显式验证凸多面体
+
+$$
+C_j=\bigcap_{k\ne j}
+\left\{h:(W_j-W_k)^\top h+b_j-b_k\ge 0\right\}.
+$$
+
+验证必须扫描该胞腔对完整词表的 $V-1$ 个半空间，而非随机 K 或 Logit Top-K，并报告
+Unembedding argmax token、LVD 胞腔 token、违规平面数、最小有符号平面距离、精确边界并列数
+和实际检查总数。两种 token 不一致、任一半空间违规或点恰处于多个胞腔的精确公共边界时均
+不得声称唯一对应关系成立。词表分块可以控制内存，但不得改变检查结果。
 
 每个模型适配器必须分别在随机张量和真实捕获的 $h_0$ 上通过两类 oracle，并覆盖有/无 bias、tied/untied weights、padding 后多 Token 位置和混合精度输入。Geometric Lens 只用于人工核对最终 norm + `lm_head` 的读出顺序，不作为上述公式的唯一 oracle。
 
@@ -734,7 +752,7 @@ $$
 - 无容量权重，即竞争边界均匀加权；
 - 只使用线性/Softplus/Hinge 响应，替换四段函数；
 - 只惩罚最大危险边界；
-- 固定 Top-K 与动态 Top-K 并集；
+- 随机 K 的取值与采样 seed；
 - 使用原始位移 $\Delta h_n$ 替代压强向量。
 
 ### 6.5 统一协方差损失
@@ -774,9 +792,9 @@ $$
 L_{total}=L_{SFT}(D_T)+\lambda L_{Unified-Cov}(D_P).
 $$
 
-$\lambda$ 不使用跨模型硬编码默认数值：先运行 target-only pilot，以辅助损失对共享可训练参数的梯度范数约为 SFT 梯度范数的 10% 作为初始化校准目标，再在 $D_P^{cal}$ 上选择并固定最终值。
+$\lambda$ 不使用跨模型硬编码默认数值：先运行 target-only pilot，以辅助损失对共享可训练参数的梯度范数约为 SFT 梯度范数的 50% 作为初始化校准目标，再在 $D_P^{cal}$ 上选择并固定最终值。
 
-梯度比例校准使用固定、版本化的目标批次与 Anchor 批次，对 $L_{SFT}$ 和未乘 $\lambda$ 的 $L_{Unified-Cov}$ 分别计算相对于两者共享的全部可训练参数的全局 $L_2$ 梯度范数。DDP/FSDP 下先对各 rank 本地平方和进行 `all_reduce(SUM)` 再开方；梯度累积关闭，使用一次独立 FP32 校准 forward/backward，不更新 optimizer。至少在 8 个校准 batch 上取梯度范数比值的中位数，以 $\lambda_0=0.1/\operatorname{median}(\|g_{aux}\|/(\|g_{sft}\|+\epsilon))$ 初始化搜索；记录零梯度、非有限值、参数集合和聚合后范数。若全参数校准在 FSDP 下不可行，必须采用有文档的固定参数子集并对所有方法保持一致，不能静默改口径。
+梯度比例校准使用固定、版本化的目标批次与 Anchor 批次，对 $L_{SFT}$ 和未乘 $\lambda$ 的 $L_{Unified-Cov}$ 分别计算相对于两者共享的全部可训练参数的全局 $L_2$ 梯度范数。DDP/FSDP 下先对各 rank 本地平方和进行 `all_reduce(SUM)` 再开方；梯度累积关闭，使用一次独立 FP32 校准 forward/backward，不更新 optimizer。至少在 8 个校准 batch 上取梯度范数比值的中位数，以 $\lambda_0=0.5/\operatorname{median}(\|g_{aux}\|/(\|g_{sft}\|+\epsilon))$ 初始化搜索；记录零梯度、非有限值、参数集合、聚合后范数及加权后的实际梯度比。若全参数校准在 FSDP 下不可行，必须采用有文档的固定参数子集并对所有方法保持一致，不能静默改口径。
 
 ### 6.6 分布式与数值要求
 
@@ -801,10 +819,36 @@ $\lambda$ 不使用跨模型硬编码默认数值：先运行 target-only pilot�
 - 最大特征值、谱有效秩；
 - 归一化各向异性，例如基于 $\Sigma/(\operatorname{Tr}(\Sigma)+\epsilon)$ 的指标；
 - $\|h_\theta-h_0\|_2$；
-- Top-K 对真实 crossing competitor 的召回率；
+- 随机竞争 Token 的累计唯一词表覆盖率；
+- 完整词表 crossing 诊断及随机样本对真实 crossing competitor 的命中率；
 - 新损失带来的时间和峰值显存开销。
 
-Top-K recall 在固定诊断子集和每个正式评测 checkpoint 上通过完整词表 Logit 精确计算；同时保存诊断子集版本、采样 seed、有效翻转位置数和 Wilson/Bootstrap 置信区间，避免不同 run 使用不同样本口径。
+完整词表 crossing 在固定诊断子集和每个正式评测 checkpoint 上通过完整词表 Logit 精确计算；同时保存诊断子集版本、随机采样 seed、累计唯一 token 数、有效翻转位置数和 Wilson/Bootstrap 置信区间，避免不同 run 使用不同样本口径。
+
+#### 6.7.1 SFT 后 token 方向 interference 检验
+
+所有 SFT 方法必须支持同一离线检验。令 $\Delta h_n=h_{\theta,n}-h_{0,n}$，其中 $h_{0,n}$
+来自绑定同一 Anchor 样本与位置的 schema-v5 all-reference cache，$h_{\theta,n}$ 来自待检验
+checkpoint。以固定基座 Unembedding 单位行 $\hat W_{0,k}$ 作为 token 方向，主统计为
+
+$$
+m_k^+=N^{-1}\sum_n\max(0,\hat W_{0,k}^{\top}\Delta h_n).
+$$
+
+正值表示 activation 朝 token $k$ 的读出方向移动；负投影表示远离，不能计入“朝该 token
+移动”。产物必须覆盖完整词表，按 $m_k^+$ 降序提供 CSV 与带坐标轴的曲线图，并保存每个 token
+的 signed mean、absolute mean、RMS 与 maximum absolute projection。汇总至少包含
+$\sum_km_k^+$、absolute movement 总和、平均 $\lVert\Delta h\rVert_2$ 和 Top 1%/5%/10%
+正向移动占比。不同方法只有在模型 revision、Anchor 指纹、位置配置和 d0 cache 完全一致时
+才可比较；排序曲线本身被强制单调，局部 interference 集中应结合头部占比而非仅凭“单峰”外观判断。
+
+#### 6.7.2 SFT 前后逐 token crossing 检验
+
+该检验不使用 d0 cache。基座模型与待检验 checkpoint 必须在完全相同的 Anchor response token
+流上运行。对每个受监督 label token，输出 argmax 与 label 不同记为 mismatch；同时报告基座
+mismatch、微调后 mismatch、基座正确而微调后错误的新增 crossing、基座错误而微调后正确的
+恢复、前后 argmax 改变次数和净 mismatch 增量。主比较项是 `new_crossing_count`、
+`new_crossing_rate_among_base_correct` 与 `tuned_mismatch_count`，不能把基座原有错误都归因于 SFT。
 
 ### 6.8 正确性测试
 
@@ -829,7 +873,7 @@ Top-K recall 在固定诊断子集和每个正式评测 checkpoint 上通过完�
 4. 3B 模型验证计算与效果；
 5. 7B/8B 主实验；
 6. 14B 或更大模型的 scaling 实验；
-7. LoRA、量化和不同邻居策略的扩展实验。
+7. LoRA、量化和不同随机 K 的扩展实验。
 
 ### 6.10 阶段验收
 
@@ -837,7 +881,7 @@ Top-K recall 在固定诊断子集和每个正式评测 checkpoint 上通过完�
 - 小模型训练无持续 NaN/Inf；
 - 相比 `target_only`，在至少 3 个随机种子的受控设置中达到预注册的 crossing/margin 改善门槛 $r_{min}$，并报告配对置信区间；
 - 目标任务主指标退化不超过预注册的 $\delta_{max}$，不能通过完全阻止模型学习来获得保护结果；
-- Top-K recall 达到预注册门槛，否则只能将结果表述为局部邻居近似下的改善；
+- 随机邻居覆盖率和完整词表 crossing 诊断达到预注册门槛，否则只能将结果表述为随机局部近似下的改善；
 - 给出时间、显存和缓存开销；
 - 给出总压强下降与归一化各向异性变化，区分“整体缩小”和“方向均分”。
 
@@ -846,7 +890,7 @@ Top-K recall 在固定诊断子集和每个正式评测 checkpoint 上通过完�
 ### 6.11 阶段产物
 
 - Unembedding 模型适配器；
-- Top-K 邻居与边际计算模块；
+- 全词表 d0 缓存与随机 K 邻居模块；
 - 四段压强、容量权重和统一协方差损失模块；
 - 参考缓存读取器；
 - 训练插件与配置；
@@ -922,7 +966,7 @@ Tier 2 只有在主方法闭环稳定后开始，且必须区分“训练时保�
 
 1. 主结果表：目标任务效果、通用能力变化、平均保留率。
 2. Scaling：模型大小与保护效果、额外计算开销的关系。
-3. 消融：响应函数、容量权重、协方差形式、Top-K 策略和三个设计目标。
+3. 消融：响应函数、容量权重、协方差形式、随机 K 大小和三个设计目标。
 4. 内部指标：
 	- LVD margin 分布；
 	- safety-core violation 和 crossing；
@@ -1071,7 +1115,7 @@ SFT-Conflict/
 - 首版优先保证公式正确，再优化吞吐量；
 - 避免全词表 Token 对、完整胞腔和不必要的 $m\times m$ 矩阵；
 - 为参考模型在线前向、缓存读取、当前模型前向和几何损失分别计时；
-- 对 Anchor Token 数量、Top-K 和缓存精度提供显存/存储估算器。
+- 对 Anchor Token 数量、词表大小、随机 K 和缓存精度提供显存/存储估算器。
 - 每次正式运行前检查 `/data1` 可用容量；低于 2 TB 或不足预计新增量 2 倍时停止并反馈。
 
 ---
@@ -1157,7 +1201,7 @@ Geometric Lens 中目前可用于人工对照的范围是：
 
 - $h_0$ 与 $h_{new}$ 的抽取位置；
 - 一个“样本”对应最后 Token、全部 Token 还是指定 Token；
-- Top-K 的初始建议；
+- 随机 K 的初始建议；
 - $\gamma_0,\mu_3,\mu_4,p,\lambda,\epsilon_d$ 的建议范围；
 - `lm_head` 冻结策略；
 - 是否已有容量权重或协方差代码；

@@ -1,0 +1,28 @@
+# Experimental crossing-priority S0 LVD+ (2026-09-29).
+# Reuses the same model-bound S0 table; DOES NOT reuse gain=1 lambda/checkpoints.
+# The old objective remains in lvd_plus_s0.yaml with the implicit gain=1 default.
+config_version: 1
+anchor_mode: recorded_s0
+s0_cache_path: null
+s0_cache_sha256: null
+top_k: 512
+position_chunk_size: 4
+exponential_rate: 0.01
+transition_width: 0.01
+exponent_clamp: 6.0
+normal_epsilon: 1.0e-12
+moment_mode: uncentered_second_moment
+# q_new = q_old + (gain-1)*H_tau(max(s-max(B,0),0)), still zero for s<=0.
+# Once past the smoothing interval: q' = exp(min(mu*u,C)) + gain - 1.
+# 32 is a mechanism-test starting point, NOT a quality-tuned optimum.
+# Region 0/1 and the original global outer moment are unchanged.
+# A stronger per-pair response does not guarantee monotone outer loss or MCC.
+post_crossing_slope_gain: 32.0
+lambda_mode: gradient_ratio
+fixed_lambda: null
+resolved_lambda: null
+target_gradient_ratio: 0.0005
+calibration_batches: 64
+calibration_accumulation_steps: 4
+calibration_seed: 20260927
+lambda_warmup_steps: 0

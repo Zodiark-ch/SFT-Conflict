@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sft-conflict"
+version = "0.1.0"
+description = "Reproducible SFT experiments for measuring and protecting general capabilities"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "accelerate>=1.3,<2",
+    "bitsandbytes>=0.45.2,<0.46",
+    "datasets>=3.2,<4",
+    "peft>=0.14,<0.15",
+    "PyYAML>=6,<7",
+    "safetensors>=0.4,<1",
+    "tensorboard>=2.18,<3",
+    "torch>=2.5,<2.6",
+    "transformers>=4.48,<4.49",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8,<9",
+    "ruff>=0.9,<1",
+]
+
+[project.scripts]
+sft-conflict = "sft_conflict.cli.main:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+addopts = "-ra"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]

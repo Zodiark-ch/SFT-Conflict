@@ -1,0 +1,41 @@
+# Label-referenced LVD+ (schema version 1), a separate objective from legacy LVD.
+# Exact method literal: target_plus_anchor_lvd+
+# Freeze the Unembedding: body_ft_frozen_head or LoRA only.
+# Use gold next-token labels at ALL eligible supervised response positions,
+# including labels Base predicts incorrectly; no Base-correct position filter.
+# Current-logit Top-K excludes the gold label, with uniform 1/K aggregation.
+# No d0/h0 cache, reference model, capacity weights, or target-only pilot is used.
+config_version: 1
+top_k: 512
+# Memory chunk size only; this never caps the number of selected positions.
+position_chunk_size: 4
+
+# Physical signed boundary-distance units, NOT a d0-normalized erosion ratio.
+# exponential_rate has inverse-distance units; transition_width has distance units.
+# Initial 0.1 failed Base RMS concentration checks on Mistral; 0.01 uses a
+# 100-unit exponential length scale. Recalibrate; never rescale the old lambda.
+# This is an engineering starting point, not a quality-optimal hyperparameter.
+exponential_rate: 0.01
+transition_width: 0.01
+# Dimensionless exponent cap; a tangent-linear tail keeps gradients nonzero.
+# Values above 20 are rejected to bound FP32 exponential growth.
+exponent_clamp: 6.0
+normal_epsilon: 1.0e-12
+moment_mode: uncentered_second_moment
+
+# RMS-only gradient-ratio calibration, once at the untouched Base before training.
+# Measure 64 groups of 4 microbatches with NO optimizer step or pilot model.
+# The first 32 groups at rate=0.01 had 79.93% single-group energy (>75%).
+# Extend the same deterministic sequence, retaining its prefix and all outliers.
+# beta=0.0005 is UNTUNED for LVD+; it is not a quality or retention guarantee.
+# NEVER reuse legacy LVD lambda values or pilot publications for this objective.
+# A manual ablation may set lambda_mode: fixed and a non-negative fixed_lambda.
+lambda_mode: gradient_ratio
+fixed_lambda: null
+# Runtime-resolved LVD+ lambda only; leave null in this source configuration.
+resolved_lambda: null
+target_gradient_ratio: 0.0005
+calibration_batches: 64
+calibration_accumulation_steps: 4
+calibration_seed: 20260927
+lambda_warmup_steps: 0

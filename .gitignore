@@ -18,3 +18,10 @@ wandb/
 # Local secrets
 .env
 *.token
+*.egg-info/
+
+# Development-only material (kept local)
+tests/
+scripts/
+docs/
+*.log

@@ -1,0 +1,16 @@
+# Full-vocabulary, exact (not sampled/Top-K) objective on ||s||_2 <= R.
+# R = 512 physical hidden-state units; NOT a global optimum over an infinite
+# domain. Convergence/certificates must be checked, and an S0 point is NOT
+# guaranteed to lie inside its label's cell.
+config_version: 1
+radius: 512.0
+token_batch_size: 128
+vocabulary_chunk_size: 32768
+max_iterations: 500
+# Physical hidden-state units; solver backtracking may reduce the initial step.
+initial_step_size: 16.0
+gap_tolerance: 1.0e-4
+# Absolute FP64 logit-margin tolerance for cell membership; also the original
+# site-ray certificate threshold. The independent classifier subtracts explicit
+# roundoff bounds and uses its separately versioned 1e-10 separation floor.
+audit_tolerance: 1.0e-5

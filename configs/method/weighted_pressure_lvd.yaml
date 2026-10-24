@@ -1,0 +1,111 @@
+# Weighted-pressure Unembedding LVD loss configuration (schema version 1).
+# run.py loads this for target_plus_anchor_lvd, target_plus_anchor_ce_lvd and
+# record_anchor_d0. Unknown fields and invalid ranges fail immediately.
+config_version: 1
+
+# d0 cache produced by METHOD="record_anchor_d0". null means run.py derives a
+# deterministic path from MODEL, ANCHOR_DATASET, position settings, filter, and seed.
+d0_cache_path: null
+
+# Anchor prediction positions used both while recording d0 and while training.
+# Dynamic: inspect every eligible response prediction position (count varies by sample).
+# sample_k_positions uses positions_per_sample instead; last_non_padding is also supported.
+position_strategy: all_selected_tokens
+positions_per_sample: 4
+position_seed: 42
+
+# d0 recording policy. base_correct keeps only positions where the base-model
+# argmax equals the true next token, matching the main protocol in REQUIREMENTS.md.
+# Other values: all_reference, minimum_confidence, minimum_margin.
+d0_filter_mode: base_correct
+# Used only by the matching minimum_* filter mode; otherwise keep null.
+d0_minimum_confidence: null
+d0_minimum_margin: null
+d0_storage_dtype: float32
+# Keep dynamic all-position inference batches small on FP32 7B models.
+d0_samples_per_shard: 4
+
+# Select the highest CURRENT logits excluding the base-model reference token.
+# random remains available only for reproducing the previous ablation.
+neighbor_strategy: current_topk
+top_k: 512
+# Bound direction-tensor memory; backward recomputes one position chunk at a time.
+position_chunk_size: 4
+
+# Allowed erosion fraction. gamma0=0.8 permits erosion of 80% of each original d0
+# margin with ZERO pressure/gradient. Beyond this core is a smoothed-linear
+# buffer; exponential response starts at the decision boundary rho=1.25.
+# Three-segment experimental default (2026-09-26); quality not yet established.
+gamma0: 0.8
+
+# New three-segment C1 pressure response. mu3 controls post-boundary exponential
+# growth. mu4 is ignored in three_segment and retained only for old configurations.
+mu3: 1.0
+mu4: 2.0
+# First 10% of the buffer uses a quadratic start so g=g'=0 at the core edge.
+# It then has unit slope; this smooth subinterval is not an extra geometric region.
+core_transition_fraction: 0.1
+# Old four_segment/four_segment_linear_tail/linear/softplus/hinge remain explicit.
+# In three_segment the exponent cap starts a C1 tangent-linear tail, not a plateau.
+response_mode: three_segment
+exponent_clamp: 6.0
+
+# Capacity weighting alpha is proportional to (d0 + epsilon_d)^(-p).
+# Larger p protects narrow/fragile boundaries more strongly.
+capacity_exponent: 1.0
+epsilon_d: 1.0e-6
+# Minimum allowed norm of W_j - W_k; degenerate boundary normals fail fast.
+normal_epsilon: 1.0e-12
+# False uses normalized uniform alpha=1/K, NOT an unnormalized sum of K terms.
+# run.py adapted_weight explicitly overrides this field; True restores capacity weights.
+use_capacity_weights: false
+
+# Numerical d0 policy. Small negative values within tolerance are logged and
+# floored only in denominators; materially negative d0 values fail immediately.
+baseline_margin_floor: 1.0e-6
+baseline_negative_tolerance: 1.0e-6
+
+# Pressure aggregation and second-moment definition used by the main method.
+# Ablations: max_boundary/raw_displacement and centered_covariance.
+# asinh_weighted_sum is an explicitly different, robust-surrogate objective;
+# it is not the original PDF formula and has NOT beaten matched CE in the audit.
+pressure_mode: weighted_sum
+moment_mode: uncentered_second_moment
+
+# Lambda policy. There is intentionally no universal numeric lambda default.
+# gradient_ratio targets RMS(||lambda*g_lvd|| / ||g_sft||)=0.0005 over
+# 32 groups of 4 microbatches. RMS keeps legitimate zeros and rare spikes rather
+# than amplifying sparse tails to match a tiny median. This is a conservative
+# initial scale, not a validated optimum for the new objective.
+# Regenerate pilot: response/transition changes invalidate old publications.
+# Legitimate all-core zero-gradient groups remain in RMS; all-zero measurements
+# fail closed. RMS half-split and single-group energy concentration are checked.
+# Inspect batch_diagnostics/weighted_auxiliary_to_target_ratios and Anchor
+# retention. A collapsed pilot or failed RMS stability gate forbids publication.
+# Fresh calibrations now use the same distributed compensation as training.
+# For a manual ablation, set
+# lambda_mode: fixed and provide fixed_lambda: <non-negative number>.
+lambda_mode: gradient_ratio
+calibration_statistic: rms
+# null: automatically discover an accepted pilot publication and reuse its
+# verified grouped gradient measurements (rescale only for the requested ratio).
+# Explicit path: load/recalibrate that pilot; legacy escape hatch, not recommended
+# on pinned FSDP because same-process calibration->new-model wrapping has crashed.
+# run.py may override this with LVD_CALIBRATION_CHECKPOINT.
+calibration_checkpoint: null
+fixed_lambda: null
+# Filled into the resolved run config after calibration; leave null in this source config.
+resolved_lambda: null
+target_gradient_ratio: 0.0005
+calibration_batches: 32
+# Each estimate accumulates the original per-microbatch losses, matching an
+# optimizer update. It does NOT pool pressure into a different large-batch loss.
+calibration_accumulation_steps: 4
+# Deterministic disjoint subsets: pilot health, selection validation, calibration,
+# then formal training. null preserves legacy loader-based calibration.
+calibration_seed: 20260925
+pilot_health_samples: 128
+pilot_validation_samples: 128
+
+# Linear warmup of the resolved lambda over optimizer steps; 0 disables warmup.
+lambda_warmup_steps: 0

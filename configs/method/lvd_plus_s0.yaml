@@ -1,0 +1,26 @@
+# LVD+ with recorded full-vocabulary probability anchors.
+# First METHOD=record_s0, then METHOD=target_plus_anchor_lvd+ in run.py.
+# Legacy configs/method/lvd_plus.yaml keeps W_j/2 for exact historical replay.
+config_version: 1
+anchor_mode: recorded_s0
+# None: derive model/revision/solver-only cache location. Never use a d0 cache.
+s0_cache_path: null
+# Filled by verified cache loading; do not reuse an old center/lambda identity.
+s0_cache_sha256: null
+top_k: 512
+position_chunk_size: 4
+# Same directional response and outer uncentered moment as existing LVD+.
+exponential_rate: 0.01
+transition_width: 0.01
+exponent_clamp: 6.0
+normal_epsilon: 1.0e-12
+moment_mode: uncentered_second_moment
+# Fresh-Base RMS for THIS anchor table; never reuse half-unembedding lambda.
+lambda_mode: gradient_ratio
+fixed_lambda: null
+resolved_lambda: null
+target_gradient_ratio: 0.0005
+calibration_batches: 64
+calibration_accumulation_steps: 4
+calibration_seed: 20260927
+lambda_warmup_steps: 0
