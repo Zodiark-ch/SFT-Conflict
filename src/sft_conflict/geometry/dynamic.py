@@ -153,6 +153,126 @@ def base_conditioned_band_widths(
     return log_width.clamp_min(math.log(torch.finfo(dtype).tiny)).exp()
 
 
+def relative_band_rows(
+    current: Tensor,
+    reference: Tensor,
+    weights: Tensor,
+    *,
+    tolerance: float = 0.5,
+    delta: float = 0.25,
+    floor: float = 1e-3,
+    surrogate: str | None = None,
+) -> tuple[Tensor, Tensor]:
+    """Per-position weighted Huber of relative margin erosion beyond a free tolerance.
+
+    Each direction keeps its own Base scale: with ``s = max(reference, floor)`` the
+    relative erosion is ``r = (reference - current) / s`` (0 at Base, 1 on the
+    boundary, above 1 crossed).  Erosion up to ``tolerance`` is free; beyond it
+    ``rows = sum_k w_k * huber_1((r - tolerance)_+ / delta)``.  Margin increases are
+    never penalised.  The second output is the weighted mean erosion per position
+    (diagnostic, detached).
+
+    ``surrogate`` replaces the objective by a linear calibration surrogate whose
+    gradient is the maximal Huber slope: ``"all"`` saturates every direction,
+    ``"nearest"`` only the direction with the smallest Base scale per position
+    (the competitor closest to its boundary).  Surrogates are used only to
+    calibrate the coefficient, never for training.
+    """
+    for name, value in (("delta", delta), ("floor", floor)):
+        if isinstance(value, bool) or not math.isfinite(value) or value <= 0:
+            raise ValueError(f"{name} must be finite and positive")
+    if surrogate not in (None, "all", "nearest"):
+        raise ValueError("surrogate must be None, 'all' or 'nearest'")
+    if isinstance(tolerance, bool) or not math.isfinite(tolerance) or not 0 <= tolerance < 1:
+        raise ValueError("tolerance must be in [0,1)")
+    if current.ndim != 2 or reference.shape != current.shape or weights.shape != current.shape:
+        raise ValueError("current, reference and weights must have matching [N,K] shapes")
+    fixed_weights = weights.detach().to(device=current.device, dtype=current.dtype)
+    fixed_reference = reference.detach().to(device=current.device, dtype=current.dtype)
+    if not torch.isfinite(fixed_weights).all() or torch.any(fixed_weights < 0):
+        raise ValueError("weights must be finite and non-negative")
+    if not torch.isfinite(fixed_reference).all():
+        raise ValueError("reference margins must be finite")
+    if not torch.allclose(
+        fixed_weights.sum(dim=-1),
+        torch.ones(len(current), dtype=current.dtype, device=current.device),
+        atol=1e-6,
+        rtol=1e-6,
+    ):
+        raise ValueError("weights must sum to one per position")
+    scale = fixed_reference.clamp_min(floor)
+    erosion = (fixed_reference - current) / scale
+    mean_erosion = (fixed_weights * erosion.detach()).sum(dim=-1)
+    if surrogate == "all":
+        return (fixed_weights * (-current / scale) / delta).sum(dim=-1), mean_erosion
+    if surrogate == "nearest":
+        nearest = torch.where(fixed_weights > 0, scale, torch.inf).argmin(dim=-1, keepdim=True)
+        picked = fixed_weights.gather(1, nearest) * (-current.gather(1, nearest))
+        return (picked / scale.gather(1, nearest) / delta).sum(dim=-1), mean_erosion
+    scaled = (erosion - tolerance).clamp_min(0) / delta
+    huber = torch.where(scaled <= 1, scaled.square() / 2, scaled - 0.5)
+    return (fixed_weights * huber).sum(dim=-1), mean_erosion
+
+
+@torch.no_grad()
+def relative_margin_gradients(
+    current: Tensor,
+    reference: Tensor,
+    weights: Tensor,
+    *,
+    tolerance: float = 0.5,
+    delta: float = 0.25,
+    floor: float = 1e-3,
+) -> Tensor:
+    """Closed-form d(rows)/d(current) of :func:`relative_band_rows` (no surrogate)."""
+    fixed_weights = weights.detach().to(device=current.device, dtype=current.dtype)
+    fixed_reference = reference.detach().to(device=current.device, dtype=current.dtype)
+    scale = fixed_reference.clamp_min(floor)
+    erosion = (fixed_reference - current.detach()) / scale
+    slope = ((erosion - tolerance).clamp_min(0) / delta).clamp_max(1)
+    return torch.where(fixed_weights > 0, -fixed_weights * slope / (delta * scale), 0.0)
+
+
+@torch.no_grad()
+def immediate_hidden_gradients(
+    hidden: Tensor,
+    weight: Tensor,
+    labels: Tensor,
+    competitors: Tensor,
+    margin_gradient: Tensor,
+    *,
+    normal_epsilon: float = 1e-6,
+    hidden_epsilon: float = 1e-6,
+    position_chunk_size: int = 4,
+) -> Tensor:
+    """Per-position gradient w.r.t. the hidden state of ``sum_k g_k * a_k`` (cosine margins).
+
+    ``d a_k / d h = n_k / (|n_k| |h|) - a_k h / |h|^2`` with ``n_k = w_gold - w_k``; the
+    result is the diagnostic "immediate" hidden gradient (before the model Jacobian).
+    """
+    if hidden.ndim != 2 or margin_gradient.shape != competitors.shape:
+        raise ValueError("hidden must be [N,H] and margin_gradient must match competitors [N,K]")
+    output = torch.zeros_like(hidden)
+    for start in range(0, len(hidden), position_chunk_size):
+        stop = start + position_chunk_size
+        local_hidden = hidden[start:stop].float()
+        gold = weight[labels[start:stop]].float()
+        rows = weight[competitors[start:stop]].float()
+        normals = gold[:, None, :] - rows
+        normal_lengths = (normals.square().sum(dim=-1) + normal_epsilon**2).sqrt()
+        hidden_lengths = (local_hidden.square().sum(dim=-1) + hidden_epsilon**2).sqrt()
+        margins = (normals * local_hidden[:, None, :]).sum(dim=-1) / (
+            normal_lengths * hidden_lengths[:, None]
+        )
+        gradient = margin_gradient[start:stop].float()
+        coefficient = gradient / (normal_lengths * hidden_lengths[:, None])
+        radial = (gradient * margins).sum(dim=-1) / hidden_lengths.square()
+        output[start:stop] = (
+            torch.einsum("nk,nkd->nd", coefficient, normals) - radial[:, None] * local_hidden
+        ).to(output.dtype)
+    return output
+
+
 class _BandHuberRows(torch.autograd.Function):
     @staticmethod
     def solve(current, reference, weights, widths, delta, solver_iterations):
@@ -284,6 +404,9 @@ class _ChunkedCenteredHuber(torch.autograd.Function):
         position_chunk_size,
         widths,
         solver_iterations,
+        relative,
+        head_gradient_scale,
+        hidden_gradient_scale,
     ):
         ctx.options = (
             delta,
@@ -292,6 +415,9 @@ class _ChunkedCenteredHuber(torch.autograd.Function):
             position_chunk_size,
             solver_iterations,
         )
+        ctx.relative = relative
+        ctx.head_gradient_scale = head_gradient_scale
+        ctx.hidden_gradient_scale = hidden_gradient_scale
         margins = []
         for start in range(0, len(hidden), position_chunk_size):
             stop = start + position_chunk_size
@@ -307,7 +433,18 @@ class _ChunkedCenteredHuber(torch.autograd.Function):
             margins.append(current)
         current = torch.cat(margins)
         margin_gradient = None
-        if widths is None:
+        if relative is not None:
+            tolerance, relative_delta, floor, surrogate = relative
+            output, common = relative_band_rows(
+                current,
+                reference,
+                weights,
+                tolerance=tolerance,
+                delta=relative_delta,
+                floor=floor,
+                surrogate=surrogate,
+            )
+        elif widths is None:
             output, common = centered_huber_rows(current, reference, weights, delta=delta)
         else:
             fixed = _band_inputs(
@@ -359,9 +496,21 @@ class _ChunkedCenteredHuber(torch.autograd.Function):
                     hidden_epsilon=hidden_epsilon,
                 )
                 if margin_gradient is None:
-                    rows, _common = centered_huber_rows(
-                        current, reference[start:stop], weights[start:stop], delta=delta
-                    )
+                    if ctx.relative is not None:
+                        tolerance, relative_delta, floor, surrogate = ctx.relative
+                        rows, _common = relative_band_rows(
+                            current,
+                            reference[start:stop],
+                            weights[start:stop],
+                            tolerance=tolerance,
+                            delta=relative_delta,
+                            floor=floor,
+                            surrogate=surrogate,
+                        )
+                    else:
+                        rows, _common = centered_huber_rows(
+                            current, reference[start:stop], weights[start:stop], delta=delta
+                        )
                     upstream = output_gradient[start:stop]
                 else:
                     rows = current
@@ -377,11 +526,21 @@ class _ChunkedCenteredHuber(torch.autograd.Function):
                 )
                 gradients = torch.autograd.grad(rows, inputs, upstream)
             if hidden_gradient is not None:
-                hidden_gradient[start:stop].copy_(gradients[0])
+                hidden_scale = ctx.hidden_gradient_scale
+                hidden_gradient[start:stop].copy_(
+                    gradients[0] * hidden_scale if hidden_scale != 1 else gradients[0]
+                )
+            # Head rows are shared by every position and token; a scale below one
+            # keeps most of the geometry correction on the hidden representation.
+            scale = ctx.head_gradient_scale
             if weight_gradient is not None:
-                weight_gradient.index_add_(0, ids, gradients[1])
+                weight_gradient.index_add_(
+                    0, ids, gradients[1] * scale if scale != 1 else gradients[1]
+                )
             if bias_gradient is not None:
-                bias_gradient.index_add_(0, ids, gradients[2])
+                bias_gradient.index_add_(
+                    0, ids, gradients[2] * scale if scale != 1 else gradients[2]
+                )
         return (
             hidden_gradient,
             weight_gradient,
@@ -390,6 +549,9 @@ class _ChunkedCenteredHuber(torch.autograd.Function):
             None,
             None,
             bias_gradient,
+            None,
+            None,
+            None,
             None,
             None,
             None,
@@ -414,12 +576,49 @@ def chunked_centered_huber_rows(
     position_chunk_size: int = 4,
     widths: Tensor | None = None,
     solver_iterations: int = 48,
+    relative: dict | None = None,
+    head_gradient_scale: float = 1.0,
+    hidden_gradient_scale: float = 1.0,
 ) -> tuple[Tensor, Tensor, Tensor]:
-    """Exact first-order local autograd, accumulating into one vocabulary-sized gradient."""
+    """Exact first-order local autograd, accumulating into one vocabulary-sized gradient.
+
+    ``head_gradient_scale`` in [0,1] multiplies only the head-row (and bias) part
+    of the geometry gradient and ``hidden_gradient_scale`` in [0,1] only the
+    hidden-state part; at most one of them may be zero.
+
+    ``relative`` selects the relative-erosion objective (keys ``tolerance``,
+    ``delta``, ``floor`` and optional ``surrogate``); it cannot be combined with
+    band ``widths``.  Without it, ``widths`` selects the Base-conditioned band and
+    ``None`` the centered balance objective.
+    """
     if type(position_chunk_size) is not int or position_chunk_size <= 0:
         raise ValueError("position_chunk_size must be a positive integer")
     if len(hidden) == 0:
         raise ValueError("chunked geometry requires at least one eligible position")
+    if (
+        isinstance(head_gradient_scale, bool)
+        or not math.isfinite(head_gradient_scale)
+        or not 0 <= head_gradient_scale <= 1
+    ):
+        raise ValueError("head_gradient_scale must be in [0,1]")
+    if (
+        isinstance(hidden_gradient_scale, bool)
+        or not math.isfinite(hidden_gradient_scale)
+        or not 0 <= hidden_gradient_scale <= 1
+    ):
+        raise ValueError("hidden_gradient_scale must be in [0,1]")
+    if head_gradient_scale == 0 and hidden_gradient_scale == 0:
+        raise ValueError("head_gradient_scale and hidden_gradient_scale cannot both be zero")
+    relative_options = None
+    if relative is not None:
+        if widths is not None:
+            raise ValueError("relative erosion and band widths are mutually exclusive")
+        relative_options = (
+            float(relative["tolerance"]),
+            float(relative["delta"]),
+            float(relative["floor"]),
+            relative.get("surrogate"),
+        )
     return _ChunkedCenteredHuber.apply(
         hidden,
         weight,
@@ -434,6 +633,9 @@ def chunked_centered_huber_rows(
         position_chunk_size,
         None if widths is None else widths.detach(),
         solver_iterations,
+        relative_options,
+        float(head_gradient_scale),
+        float(hidden_gradient_scale),
     )
 
 

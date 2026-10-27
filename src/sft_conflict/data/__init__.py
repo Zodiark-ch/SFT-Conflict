@@ -1,5 +1,13 @@
 """Target and anchor data loading."""
 
+from .anchor_creation import (
+    SMART_SUBMIXTURES,
+    build_label_set_table,
+    created_anchor_dataset_dir,
+    created_anchor_dataset_name,
+    load_created_anchor_manifest,
+    select_task_vocab_cover,
+)
 from .anchor_filtering import (
     AnchorFilterScore,
     TokenCoverSelection,
@@ -51,6 +59,12 @@ from .registry import (
 )
 
 __all__ = [
+    "SMART_SUBMIXTURES",
+    "build_label_set_table",
+    "created_anchor_dataset_dir",
+    "created_anchor_dataset_name",
+    "load_created_anchor_manifest",
+    "select_task_vocab_cover",
     "CausalLMCollator",
     "AnchorFilterScore",
     "anchor_filter_score_dir",

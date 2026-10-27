@@ -56,6 +56,7 @@ from sft_conflict.data import (
     TargetStreamCollator,
 )
 from sft_conflict.data.dual_stream import EpochAwareSequentialSampler
+from sft_conflict.evaluation.native import sharded_classification_counts
 from sft_conflict.losses import (
     AnchorLVDLoss,
     CountAwareMetricAccumulator,
@@ -81,6 +82,7 @@ from sft_conflict.trainers.lvd_plus_calibration import (
     calibrate_lvd_plus_lambda as _calibrate_lvd_plus_lambda,
 )
 from sft_conflict.trainers.lvd_plus_calibration import reuse_lvd_plus_prepared_model
+from sft_conflict.trainers.native_selection import NativeSelection
 
 if TYPE_CHECKING:
     from sft_conflict.losses.lvd_plus import AnchorLVDPlusLoss
@@ -263,6 +265,7 @@ class SFTConflictTrainer(Trainer):
         resolved_lvd_lambda: float | None = None,
         lvd_plus_config: LVDPlusConfig | None = None,
         resolved_lvd_plus_lambda: float | None = None,
+        native_selection: NativeSelection | None = None,
         **kwargs: Any,
     ) -> None:
         if method_config.name.uses_lvd_plus:
@@ -351,6 +354,7 @@ class SFTConflictTrainer(Trainer):
         )
         self.data_config = data_config
         self.preview_tokenizer = preview_tokenizer
+        self.native_selection = native_selection
         self._evaluation_tensor_preview_printed = False
         self.method_config = method_config
         self.resolved_config = resolved_config
@@ -1372,7 +1376,7 @@ class SFTConflictTrainer(Trainer):
         accumulator = self._metric_accumulators["eval"]
         accumulator.reset()
         try:
-            return super().evaluate(
+            metrics = super().evaluate(
                 eval_dataset=eval_dataset,
                 ignore_keys=ignore_keys,
                 metric_key_prefix=metric_key_prefix,
@@ -1381,6 +1385,47 @@ class SFTConflictTrainer(Trainer):
             # Failed/repeated evaluations must not leak a partial window. Never
             # reset the pending training window (including the resume path).
             accumulator.reset()
+        if self.native_selection is not None and (
+            eval_dataset is None or eval_dataset is self.eval_dataset
+        ):
+            # The native metric belongs to the training validation split only; other
+            # datasets (the held-out evaluation split) keep the plain loss metrics.
+            native_metrics = self._native_selection_metrics(metric_key_prefix)
+            # Bypass the window-aware log override: this is a standalone record.
+            Trainer.log(self, native_metrics)
+            metrics.update(native_metrics)
+        return metrics
+
+    def _native_selection_metrics(self, prefix: str) -> dict[str, float]:
+        selection = self.native_selection
+        model = self.model
+        was_training = model.training
+        model.eval()
+        try:
+            correct, total = sharded_classification_counts(
+                selection.evaluator,
+                model,
+                selection.tokenizer,
+                selection.dataset,
+                batch_size=selection.batch_size,
+                rank=self.accelerator.process_index,
+                world_size=self.accelerator.num_processes,
+                inference_mode=not self.is_fsdp_enabled,
+            )
+        finally:
+            model.train(was_training)
+        counts = torch.tensor([correct, total], dtype=torch.float64, device=self.args.device)
+        counts = self.accelerator.reduce(counts, reduction="sum")
+        correct, total = (float(value) for value in counts.tolist())
+        if total != len(selection.dataset):
+            raise RuntimeError(
+                f"native selection scored {total:g} of {len(selection.dataset)} validation samples"
+            )
+        return {
+            f"{prefix}_native_accuracy": correct / total,
+            f"{prefix}_native_correct": correct,
+            f"{prefix}_native_sample_count": total,
+        }
 
     def _record_loss_result(self, result: LossResult) -> None:
         phase = "train" if self.model.training else "eval"

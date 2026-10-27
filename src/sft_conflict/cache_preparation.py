@@ -18,6 +18,10 @@ from huggingface_hub import snapshot_download, try_to_load_from_cache
 from transformers import AutoTokenizer
 
 from sft_conflict.config import DatasetConfig, MethodName
+from sft_conflict.data.anchor_creation import (
+    created_anchor_dataset_dir,
+    load_created_anchor_manifest,
+)
 from sft_conflict.data.anchor_filtering import filtered_anchor_dataset_dir
 from sft_conflict.data.label_coverage import (
     LABEL_COVERAGE_POLICY,
@@ -31,6 +35,7 @@ from sft_conflict.data.label_coverage import (
 from sft_conflict.data.loading import load_tokenized_dataset
 from sft_conflict.quick_run import (
     ANCHOR_DATASET_PRESETS,
+    CREATED_ANCHOR_DATASETS,
     FILTERED_ANCHOR_DATASETS,
     MODEL_PRESETS,
     TARGET_DATASET_PRESETS,
@@ -547,6 +552,10 @@ def prepare_label_coverage_dataset(
 
 def ensure_preset_cache(settings: QuickRunSettings, *, auto_prepare: bool) -> None:
     settings.validate()
+    if settings.action == "create-anchor-dataset":
+        # The anchor creation workflow prepares its own tokenizer, submixture and
+        # model caches; no Target/Anchor preset cache is involved.
+        return
     if settings.action == "record-s0":
         # Recording uses only the fixed Unembedding. Never touch Target/Anchor
         # caches or build label coverage as an accidental preprocessing step.
@@ -571,6 +580,27 @@ def ensure_preset_cache(settings: QuickRunSettings, *, auto_prepare: bool) -> No
         # The parent runs this before launching workers. Subsequent calls verify
         # the manifest and selected records, but never retokenize the full source.
         prepare_label_coverage_dataset(settings, auto_prepare=auto_prepare)
+    created_anchor = settings.anchor_dataset in CREATED_ANCHOR_DATASETS
+    if created_anchor:
+        created_dir = created_anchor_dataset_dir(
+            settings.artifact_root, settings.model, settings.max_length
+        )
+        try:
+            load_created_anchor_manifest(
+                created_dir,
+                model_name=settings.model,
+                model_id=_label_coverage_model_id(settings),
+                model_revision=MODEL_PRESETS[settings.model].revision,
+                max_length=settings.max_length,
+                # The launcher parent replays every record once; distributed
+                # workers only re-check the signed manifest and file hashes.
+                verify_records="RANK" not in os.environ,
+            )
+        except (ValueError, OSError) as exc:
+            raise PresetCacheError(
+                f"Created Anchor dataset is missing or incompatible: {created_dir}. Run "
+                "METHOD='create_anchor_dataset' with the same MODEL and MAX_LENGTH first."
+            ) from exc
     lvd_plus_preparation = MethodName(settings.method).is_lvd_plus_preparation
     target_preset = TARGET_DATASET_PRESETS[settings.target_dataset]
     if lvd_plus_preparation:
@@ -592,6 +622,7 @@ def ensure_preset_cache(settings: QuickRunSettings, *, auto_prepare: bool) -> No
     anchor_only = MethodName(settings.method) in {
         MethodName.PREPARE_ANCHOR_GEOMETRY_REFERENCE,
         MethodName.FILTERING_ANCHOR,
+        MethodName.CREATE_ANCHOR_DATASET,
         MethodName.RECORD_ANCHOR_D0,
         MethodName.TEST_INTERFERENCE,
         MethodName.TEST_CROSSING,
@@ -606,7 +637,7 @@ def ensure_preset_cache(settings: QuickRunSettings, *, auto_prepare: bool) -> No
     )
     filtered_anchor = settings.anchor_dataset in FILTERED_ANCHOR_DATASETS
     filtered_anchor_dir = filtered_anchor_dataset_dir(settings.artifact_root, settings.model)
-    if label_coverage_anchor:
+    if label_coverage_anchor or created_anchor:
         missing_anchor = False
     elif filtered_anchor:
         missing_anchor = (

@@ -40,6 +40,11 @@ from sft_conflict.config import (
     load_lvd_plus_config,
     load_s0_config,
 )
+from sft_conflict.data.anchor_creation import (
+    created_anchor_dataset_dir,
+    created_anchor_dataset_name,
+    load_created_anchor_manifest,
+)
 from sft_conflict.data.anchor_filtering import (
     filtered_anchor_dataset_dir,
     filtered_anchor_dataset_name,
@@ -54,6 +59,7 @@ from sft_conflict.data.label_coverage import (
 )
 from sft_conflict.data.registry import DEFAULT_DATASET_REGISTRY, DatasetRole
 from sft_conflict.data.s0_cache import S0_CACHE_CONTRACT_VERSION
+from sft_conflict.paths import DEFAULT_ARTIFACT_ROOT
 
 
 @dataclass(frozen=True)
@@ -209,6 +215,9 @@ FILTERED_ANCHOR_DATASETS = tuple(
 LABEL_COVERAGE_ANCHOR_DATASETS = tuple(
     label_coverage_dataset_name(model_name) for model_name in MODEL_PRESETS
 )
+CREATED_ANCHOR_DATASETS = tuple(
+    created_anchor_dataset_name(model_name) for model_name in MODEL_PRESETS
+)
 
 EVALUATION_DATASET_PRESETS = {
     "hellaswag": _registry_preset("hellaswag", DatasetRole.GENERAL_EVALUATION)
@@ -220,6 +229,7 @@ RUN_ANCHOR_DATASETS = (
     *ANCHOR_DATASET_PRESETS,
     *FILTERED_ANCHOR_DATASETS,
     *LABEL_COVERAGE_ANCHOR_DATASETS,
+    *CREATED_ANCHOR_DATASETS,
 )
 RUN_SUPERVISION_MODES = ("response_only",)
 DEFAULT_LVD_CONFIG_PATH = (
@@ -286,7 +296,7 @@ class QuickRunSettings:
     anchor_weight: float = 0.2
     kl_temperature: float = 1.0
     seed: int = 42
-    artifact_root: str = "/data1/chenhang/SFT_Conflict/artifacts"
+    artifact_root: str = DEFAULT_ARTIFACT_ROOT
     run_name: str | None = None
     lvd_config_path: str = str(DEFAULT_LVD_CONFIG_PATH)
     lvd_direction: int | None = None
@@ -304,6 +314,8 @@ class QuickRunSettings:
     lvd_plus_lambda_cache_path: str | None = None
     anchor_geometry_config_path: str = str(DEFAULT_ANCHOR_GEOMETRY_CONFIG_PATH)
     anchor_geometry_reference_path: str | None = None
+    # Appended last: positional construction of older settings must keep working.
+    best_model_metric: str = "eval_loss"
 
     def validate(self) -> None:
         if (
@@ -325,6 +337,7 @@ class QuickRunSettings:
             "test-interference",
             "test-crossing",
             "filtering-anchor",
+            "create-anchor-dataset",
             "record-s0",
             "prepare-anchor-geometry-reference",
             *_LVD_PLUS_PREPARATION_ACTIONS.values(),
@@ -442,15 +455,35 @@ class QuickRunSettings:
                 raise ValueError("filtering_policy must be label_coverage_v1 or legacy_quality_v1")
         if self.action == "filtering-anchor" and method is not MethodName.FILTERING_ANCHOR:
             raise ValueError("action=filtering-anchor requires method=filtering_anchor")
+        if method is MethodName.CREATE_ANCHOR_DATASET:
+            if self.action != "create-anchor-dataset":
+                raise ValueError("create_anchor_dataset requires action=create-anchor-dataset")
+            if self.anchor_dataset != "smart_flan":
+                raise ValueError(
+                    "create_anchor_dataset reads the fixed SMART FLAN 2022 submixtures; "
+                    "keep anchor_dataset=smart_flan as the placeholder"
+                )
+        if (
+            self.action == "create-anchor-dataset"
+            and method is not MethodName.CREATE_ANCHOR_DATASET
+        ):
+            raise ValueError("action=create-anchor-dataset requires method=create_anchor_dataset")
         label_coverage_anchor = self.anchor_dataset in LABEL_COVERAGE_ANCHOR_DATASETS
+        created_anchor = self.anchor_dataset in CREATED_ANCHOR_DATASETS
         expected_filtered_anchor = (
             label_coverage_dataset_name(self.model)
             if label_coverage_anchor
+            else created_anchor_dataset_name(self.model)
+            if created_anchor
             else filtered_anchor_dataset_name(self.model)
         )
         if (
             not record_s0
-            and (label_coverage_anchor or self.anchor_dataset in FILTERED_ANCHOR_DATASETS)
+            and (
+                label_coverage_anchor
+                or created_anchor
+                or self.anchor_dataset in FILTERED_ANCHOR_DATASETS
+            )
             and self.anchor_dataset != expected_filtered_anchor
         ):
             raise ValueError(
@@ -784,6 +817,7 @@ def build_quick_run_config(settings: QuickRunSettings) -> ExperimentConfig:
     anchor_only = method in {
         MethodName.RECORD_ANCHOR_D0,
         MethodName.FILTERING_ANCHOR,
+        MethodName.CREATE_ANCHOR_DATASET,
         MethodName.TEST_INTERFERENCE,
         MethodName.TEST_CROSSING,
     } or settings.action in {"record-anchor-d0", "test-interference", "test-crossing"}
@@ -893,6 +927,30 @@ def build_quick_run_config(settings: QuickRunSettings) -> ExperimentConfig:
         anchor_config = DatasetConfig(
             source="jsonl",
             path=str(filtered_dir / "train.jsonl"),
+            adapter="tokenized",
+            max_samples=None,
+        )
+    elif settings.anchor_dataset in CREATED_ANCHOR_DATASETS:
+        created_dir = created_anchor_dataset_dir(artifact_root, settings.model, settings.max_length)
+        # Verifies policy, model identity, tokenization contract and the signed
+        # manifest; the full record replay runs once in ensure_preset_cache.
+        try:
+            load_created_anchor_manifest(
+                created_dir,
+                model_name=settings.model,
+                model_id=model_id,
+                model_revision=model_preset.revision,
+                max_length=settings.max_length,
+                verify_records=False,
+            )
+        except (ValueError, OSError) as exc:
+            raise FileNotFoundError(
+                f"created Anchor dataset is missing or incompatible: {created_dir}; run "
+                "METHOD='create_anchor_dataset' with the same MODEL and MAX_LENGTH first"
+            ) from exc
+        anchor_config = DatasetConfig(
+            source="jsonl",
+            path=str(created_dir / "train.jsonl"),
             adapter="tokenized",
             max_samples=None,
         )
@@ -1111,6 +1169,7 @@ def build_quick_run_config(settings: QuickRunSettings) -> ExperimentConfig:
             data_seed=settings.seed,
             distributed_strategy=settings.distributed_strategy,
             report_to=(),
+            best_model_metric=settings.best_model_metric,
         ),
         evaluation=EvaluationConfig(
             target=evaluation_config,

@@ -14,6 +14,8 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
+from sft_conflict.paths import DEFAULT_LM_EVAL_HARNESS_PATH
+
 TASK_CACHE_CHECK_SCRIPT = """
 import json
 import sys
@@ -39,7 +41,7 @@ class LmEvalRequest:
     model_args: str
     tasks: tuple[str, ...]
     output_path: str
-    harness_path: str = "/data1/chenhang/SFT_Conflict/artifacts/lm-harness"
+    harness_path: str = DEFAULT_LM_EVAL_HARNESS_PATH
     batch_size: str = "auto"
     num_fewshot: int | None = None
     limit: float | None = None

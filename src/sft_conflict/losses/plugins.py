@@ -766,7 +766,9 @@ def build_loss_plugins(
         if anchor_geometry_config is None or anchor_geometry_reference is None:
             raise ValueError("dynamic geometry requires its own config and output reference")
         plugins.append(AnchorCrossEntropy(weight=config.anchor_weight))
-        plugins.append(AnchorGeometryLoss(anchor_geometry_config, anchor_geometry_reference))
+        geometry = AnchorGeometryLoss(anchor_geometry_config, anchor_geometry_reference)
+        geometry.anchor_weight = float(config.anchor_weight)
+        plugins.append(geometry)
     elif config.name is MethodName.TARGET_PLUS_ANCHOR_CE:
         plugins.append(AnchorCrossEntropy(weight=config.anchor_weight))
     elif config.name is MethodName.TARGET_PLUS_ANCHOR_KL:

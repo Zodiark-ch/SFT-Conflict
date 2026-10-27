@@ -1,0 +1,57 @@
+# AEGIS objective (METHOD="target_plus_anchor_ce_geometry"; objective relative_band_v3).
+# For every Base-correct supervised pervasive token (gold y) and every selected competitor k,
+# the normalized margin a_k = ((w_y - w_k)^T h + b_y - b_k) / (||w_y - w_k|| ||h||) is compared
+# with its Base value a0_k (METHOD="prepare_anchor_geometry_reference"):
+#   erosion r_k = (a0_k - a_k) / max(a0_k, margin_floor)   (0 at Base, 1 on the boundary)
+#   loss = mean over positions of sum_k w_k * Huber(max(r_k - relative_tolerance, 0) / relative_delta)
+# Margin increases are never penalised. After geometry_start_step CE warm-up steps, lambda is
+# calibrated once: with every direction at its maximal slope (saturated_slope), the geometry
+# gradient equals geometry_gradient_ratio times the weighted pervasive-CE gradient (RMS over
+# calibration_groups groups); it then ramps in over geometry_ramp_steps steps.
+config_version: 3
+objective: relative_band_v3
+relative_tolerance: 0.0
+relative_delta: 1.0
+margin_floor: 0.03
+calibration_mode: saturated_slope
+# Gradient routing: fractions of the geometry gradient that reach the unembedding rows
+# (head_gradient_scale) and the hidden states (hidden_gradient_scale); 0 disables a path.
+head_gradient_scale: 1.0
+hidden_gradient_scale: 0.0
+# Per-micro-batch cap: the coefficient is scaled down whenever the geometry's immediate pull
+# exceeds pull_cap_ratio times the weighted pervasive-CE pull (null = no cap).
+pull_cap_ratio: 20
+# Unused by relative_band_v3 (kept for schema completeness).
+band_scale_ratio: 0.1
+band_temperature: 2.0
+band_frequency_strength: 0.1
+band_scale_top_k: 128
+band_solver_iterations: 48
+band_min_calibration_rms: 1.0e-6
+geometry_delta: 0.01
+# Directions per position: current top-k, Base top-k and frequency-weighted coverage
+# competitors, with the given weight masses.
+current_directions: 128
+base_directions: 128
+coverage_directions: 256
+current_mass: 0.5
+base_mass: 0.4
+coverage_mass: 0.1
+base_top_k: 512
+coverage_cap_multiplier: 8.0
+coverage_seed: 42
+normal_epsilon: 1.0e-6
+hidden_epsilon: 1.0e-6
+position_chunk_size: 4
+reference_samples_per_shard: 32
+reference_cache_path: null
+reference_sha256: null
+# CE warm-up, calibration and ramp.
+geometry_start_step: 5
+calibration_groups: 16
+calibration_seed: 42
+geometry_gradient_ratio: 30
+geometry_ramp_steps: 10
+resolved_lambda: null
+calibrated_at_step: null
+calibration_sha256: null

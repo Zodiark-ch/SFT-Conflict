@@ -71,6 +71,7 @@ from sft_conflict.data import (
     write_filtered_anchor_artifacts,
     write_leakage_report,
 )
+from sft_conflict.data.anchor_creation import SUBMIXTURE_KEYS
 from sft_conflict.data.collator import model_tensor_inputs
 from sft_conflict.data.label_coverage import LABEL_COVERAGE_POLICY, LEGACY_FILTER_POLICY
 from sft_conflict.diagnostics import (
@@ -92,6 +93,7 @@ from sft_conflict.evaluation.alpaca_eval_bridge import (
     run_official_alpaca_eval,
     write_alpaca_eval_scoring_instructions,
 )
+from sft_conflict.evaluation.native import ClassificationEvaluator
 from sft_conflict.geometry import audit_lvd_partition
 from sft_conflict.models import (
     ModelAudit,
@@ -104,6 +106,11 @@ from sft_conflict.models import (
     load_model_bundle,
     load_reference_model,
     torch_dtype_for_precision,
+)
+from sft_conflict.paths import (
+    DEFAULT_ARTIFACT_ROOT,
+    DEFAULT_LM_EVAL_HARNESS_PATH,
+    DEFAULT_LM_EVAL_PYTHON,
 )
 from sft_conflict.quick_run import (
     DEFAULT_ANCHOR_GEOMETRY_CONFIG_PATH,
@@ -130,6 +137,7 @@ from sft_conflict.tracking import (
     write_json_atomic,
 )
 from sft_conflict.trainers import SFTConflictTrainer
+from sft_conflict.trainers.native_selection import NativeSelection
 
 
 def _world_size() -> int:
@@ -248,7 +256,11 @@ def _training_arguments(
     checkpoint_dir: Path,
     tensorboard_dir: Path,
     has_eval_dataset: bool,
+    best_model_metric: str = "eval_loss",
 ) -> TrainingArguments:
+    if best_model_metric not in {"eval_loss", "native_accuracy"}:
+        raise ConfigError("best_model_metric must be eval_loss or native_accuracy")
+    native_selection = has_eval_dataset and best_model_metric == "native_accuracy"
     strategy = _distributed_strategy(config, audit)
     kwargs: dict[str, Any] = {}
     if strategy == "fsdp":
@@ -283,8 +295,10 @@ def _training_arguments(
         save_total_limit=config.training.save_total_limit,
         save_safetensors=True,
         load_best_model_at_end=has_eval_dataset,
-        metric_for_best_model="eval_loss" if has_eval_dataset else None,
-        greater_is_better=False if has_eval_dataset else None,
+        metric_for_best_model=(
+            ("native_accuracy" if native_selection else "eval_loss") if has_eval_dataset else None
+        ),
+        greater_is_better=(native_selection if has_eval_dataset else None),
         seed=config.training.seed,
         data_seed=config.training.data_seed,
         bf16=trainer_mixed_precision and config.training.mixed_precision == "bf16",
@@ -361,6 +375,37 @@ def _load_datasets(
     return target, anchor, validation, evaluation
 
 
+def _native_selection(config: ExperimentConfig, tokenizer, validation_dataset):
+    """Validation-split native accuracy for best-checkpoint selection, when requested."""
+    if config.training.best_model_metric != "native_accuracy":
+        return None
+    if validation_dataset is None or config.data.validation is None:
+        raise ConfigError(
+            "best_model_metric=native_accuracy needs the training validation split "
+            "(keep --training-validation enabled)"
+        )
+    task_name = config.data.validation.adapter
+    try:
+        evaluator = build_native_evaluator(task_name, max_input_length=config.data.max_length)
+    except ValueError as exc:
+        raise ConfigError(
+            f"best_model_metric=native_accuracy has no native evaluator for {task_name!r}: {exc}"
+        ) from exc
+    if not isinstance(evaluator, ClassificationEvaluator) or not evaluator.supports_selection():
+        raise ConfigError(
+            "best_model_metric=native_accuracy requires a fixed-candidate classification task "
+            f"(got {type(evaluator).__name__} for {task_name!r})"
+        )
+    dataset = load_logical_dataset(config.data.validation, cache_dir=_cache_paths(config)[1])
+    return NativeSelection(
+        evaluator=evaluator,
+        dataset=dataset,
+        tokenizer=tokenizer,
+        batch_size=config.evaluation.batch_size,
+        task_name=task_name,
+    )
+
+
 def _build_trainer(
     config: ExperimentConfig,
     bundle,
@@ -370,6 +415,7 @@ def _build_trainer(
     paths,
     *,
     with_reference: bool,
+    validation_dataset=None,
 ) -> SFTConflictTrainer:
     reference_model = (
         load_reference_model(
@@ -385,12 +431,18 @@ def _build_trainer(
         )
         else None
     )
+    native_selection = (
+        _native_selection(config, bundle.tokenizer, validation_dataset)
+        if eval_dataset is not None
+        else None
+    )
     arguments = _training_arguments(
         config,
         bundle.audit,
         checkpoint_dir=paths.checkpoint_dir,
         tensorboard_dir=paths.tensorboard_dir,
         has_eval_dataset=eval_dataset is not None,
+        best_model_metric="native_accuracy" if native_selection is not None else "eval_loss",
     )
     reference_cache = None
     resolved_lvd_lambda = None
@@ -451,8 +503,16 @@ def _build_trainer(
         lvd_config=config.lvd,
         reference_cache=reference_cache,
         resolved_lvd_lambda=resolved_lvd_lambda,
+        native_selection=native_selection,
         **plus_kwargs,
     )
+    if native_selection is not None and _is_world_process_zero():
+        print(
+            "Best-checkpoint selection: native validation accuracy "
+            f"(task={native_selection.task_name}, samples={len(native_selection.dataset)}, "
+            f"candidates={native_selection.evaluator.candidate_responses()})",
+            flush=True,
+        )
     trainer.add_callback(JsonlMetricsCallback(paths.result_dir / "metrics.jsonl"))
     trainer.add_callback(MemoryDiagnosticsCallback(paths.result_dir))
     return trainer
@@ -831,6 +891,7 @@ def _train(config: ExperimentConfig) -> dict[str, Any]:
         validation or evaluation,
         paths,
         with_reference=True,
+        validation_dataset=validation,
     )
     lvd_plus_calibration = None
     if config.method.name.uses_lvd_plus:
@@ -1238,6 +1299,7 @@ def preset_settings_from_args(args: argparse.Namespace) -> QuickRunSettings:
         gradient_checkpointing=args.gradient_checkpointing,
         run_after_training=args.run_after_training,
         training_validation=args.training_validation,
+        best_model_metric=args.best_model_metric,
         lora_rank=args.lora_rank,
         lora_alpha=args.lora_alpha,
         lora_dropout=args.lora_dropout,
@@ -2453,6 +2515,24 @@ def _preset_run(args: argparse.Namespace) -> dict[str, Any]:
     if args.action == "filtering-anchor" and settings.filtering_policy == LABEL_COVERAGE_POLICY:
         # No experiment model/config construction, reference YAML, or CUDA setup.
         return prepare_label_coverage_dataset(settings, auto_prepare=args.auto_prepare_cache)
+    if args.action == "create-anchor-dataset":
+        # CPU selection over the fixed SMART submixtures plus an optional single-GPU
+        # accuracy report; no experiment config, reference YAML or launcher is used.
+        from sft_conflict.anchor_creation_workflow import (
+            AnchorCreationOptions,
+            create_anchor_dataset,
+        )
+
+        options = AnchorCreationOptions(
+            seed=args.anchor_creation_seed,
+            workers=args.anchor_creation_workers,
+            scoring_batch_size=args.anchor_creation_scoring_batch_size,
+            compute_accuracy=args.anchor_creation_compute_accuracy,
+            submixtures=tuple(args.anchor_creation_submixture or SUBMIXTURE_KEYS),
+            max_samples_per_task=args.anchor_creation_max_samples_per_task,
+            guarantee_task_coverage=args.anchor_creation_guarantee_task_coverage,
+        )
+        return create_anchor_dataset(settings, options, auto_prepare=args.auto_prepare_cache)
     ensure_preset_cache(settings, auto_prepare=args.auto_prepare_cache)
     config = build_quick_run_config(settings)
     if args.action == "prepare-anchor-geometry-reference":
@@ -2552,6 +2632,13 @@ def _positive_int(value: str) -> int:
     return parsed
 
 
+def _non_negative_int(value: str) -> int:
+    parsed = int(value)
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("value must be a non-negative integer")
+    return parsed
+
+
 def _add_lvd_audit_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--lvd-audit-max-positions", type=_positive_int, default=8)
     parser.add_argument(
@@ -2590,6 +2677,7 @@ def _parser() -> argparse.ArgumentParser:
             "test-interference",
             "test-crossing",
             "filtering-anchor",
+            "create-anchor-dataset",
         ),
         default="train",
     )
@@ -2662,6 +2750,33 @@ def _parser() -> argparse.ArgumentParser:
         default=LABEL_COVERAGE_POLICY,
         help="Label-only source-order cover (CPU); legacy policy retains correctness filtering.",
     )
+    run_parser.add_argument("--anchor-creation-seed", type=int, default=42)
+    run_parser.add_argument("--anchor-creation-workers", type=_non_negative_int, default=8)
+    run_parser.add_argument("--anchor-creation-scoring-batch-size", type=_positive_int, default=4)
+    run_parser.add_argument(
+        "--anchor-creation-compute-accuracy",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Report base-model teacher-forced accuracy on the created Anchor dataset.",
+    )
+    run_parser.add_argument(
+        "--anchor-creation-submixture",
+        action="append",
+        choices=SUBMIXTURE_KEYS,
+        help="Restrict create-anchor-dataset to these SMART submixtures (default: all five).",
+    )
+    run_parser.add_argument(
+        "--anchor-creation-max-samples-per-task",
+        type=_optional_positive_int,
+        default=None,
+        help="Smoke-test cap on samples per task; None traverses every sample.",
+    )
+    run_parser.add_argument(
+        "--anchor-creation-guarantee-task-coverage",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Keep each task's first drawn supervised sample unconditionally on its first turn.",
+    )
     run_parser.add_argument(
         "--evaluation-max-samples",
         type=_optional_positive_int,
@@ -2713,6 +2828,16 @@ def _parser() -> argparse.ArgumentParser:
         action=argparse.BooleanOptionalAction,
         default=True,
     )
+    run_parser.add_argument(
+        "--best-model-metric",
+        choices=("eval_loss", "native_accuracy"),
+        default="eval_loss",
+        help=(
+            "validation metric that picks the checkpoint loaded at the end of training: "
+            "the evaluation loss or the task-native classification accuracy on the "
+            "same training validation split"
+        ),
+    )
     run_parser.add_argument("--lora-rank", type=int, default=8)
     run_parser.add_argument("--lora-alpha", type=int, default=32)
     run_parser.add_argument("--lora-dropout", type=float, default=0.05)
@@ -2721,7 +2846,7 @@ def _parser() -> argparse.ArgumentParser:
     run_parser.add_argument("--seed", type=int, default=42)
     run_parser.add_argument(
         "--artifact-root",
-        default="/data1/chenhang/SFT_Conflict/artifacts",
+        default=DEFAULT_ARTIFACT_ROOT,
     )
     run_parser.add_argument("--run-name")
     run_parser.add_argument("--lvd-config", default=str(DEFAULT_LVD_CONFIG_PATH))
@@ -2845,11 +2970,11 @@ def _parser() -> argparse.ArgumentParser:
     run_parser.add_argument("--benchmark-output-dir")
     run_parser.add_argument(
         "--lm-eval-python",
-        default="/data1/chenhang/SFT_Conflict/artifacts/envs/lm-eval/bin/python",
+        default=DEFAULT_LM_EVAL_PYTHON,
     )
     run_parser.add_argument(
         "--lm-eval-harness-path",
-        default="/data1/chenhang/SFT_Conflict/artifacts/lm-harness",
+        default=DEFAULT_LM_EVAL_HARNESS_PATH,
     )
     run_parser.add_argument("--lm-eval-batch-size", default="auto")
 
@@ -2887,12 +3012,12 @@ def _parser() -> argparse.ArgumentParser:
     lm_eval_parser = commands.add_parser("lm-eval", help="Run isolated lm-eval 0.4.9")
     lm_eval_parser.add_argument(
         "--python",
-        default="/data1/chenhang/SFT_Conflict/artifacts/envs/lm-eval/bin/python",
+        default=DEFAULT_LM_EVAL_PYTHON,
     )
     lm_eval_parser.add_argument("--model", default="hf")
     lm_eval_parser.add_argument(
         "--harness-path",
-        default="/data1/chenhang/SFT_Conflict/artifacts/lm-harness",
+        default=DEFAULT_LM_EVAL_HARNESS_PATH,
     )
     lm_eval_parser.add_argument("--model-args", required=True)
     lm_eval_parser.add_argument("--tasks", required=True)

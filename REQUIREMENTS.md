@@ -272,15 +272,15 @@ CLI + YAML/dataclass config
 | GPU | 单机最多 4×NVIDIA A100-SXM4-40GB，Driver 535.129.03，驱动报告 CUDA 12.2，MIG 关闭 |
 | 并行策略 | 0.5B/LoRA 默认 DDP；3B/7B Full FT 默认 FSDP Full Shard；支持 1 至 4 卡 |
 | 配置系统 | YAML + dataclass；首版不引入 Hydra |
-| Artifact 根目录 | `/data1/chenhang/SFT_Conflict/artifacts`，位于 Git 仓库之外 |
-| 文件系统容量 | `/data1` 为 14 TB ext4；检查时已用 2.9 TB、可用约 11 TB、inode 使用约 1%。该数值只代表检查时快照，实际运行以容量闸门为准 |
+| Artifact 根目录 | `<artifact-root>`（默认为仓库同级的 `artifacts/`，可由 `SFT_CONFLICT_ARTIFACT_ROOT` 指定），位于 Git 仓库之外 |
+| 文件系统容量 | 数据盘为 14 TB ext4；检查时已用 2.9 TB、可用约 11 TB、inode 使用约 1%。该数值只代表检查时快照，实际运行以容量闸门为准 |
 | 容量告警 | 每次正式运行前估算产物；若可用空间低于 2 TB 或低于本次预计新增量的 2 倍，停止启动并反馈 |
 | Python/CUDA 环境现状 | 系统仅有 Python 3.10.12，尚无 PyTorch；实现阶段创建独立环境，并验证 PyTorch CUDA 与 BF16 支持 |
 
 Artifact 默认布局：
 
 ```text
-/data1/chenhang/SFT_Conflict/artifacts/
+<artifact-root>/
 ├── hf_cache/
 │   ├── hub/
 │   └── datasets/
@@ -294,9 +294,9 @@ Artifact 默认布局：
 集中设置：
 
 ```text
-HF_HOME=/data1/chenhang/SFT_Conflict/artifacts/hf_cache
-HF_HUB_CACHE=/data1/chenhang/SFT_Conflict/artifacts/hf_cache/hub
-HF_DATASETS_CACHE=/data1/chenhang/SFT_Conflict/artifacts/hf_cache/datasets
+HF_HOME=<artifact-root>/hf_cache
+HF_HUB_CACHE=<artifact-root>/hf_cache/hub
+HF_DATASETS_CACHE=<artifact-root>/hf_cache/datasets
 ```
 
 按当前网络策略，训练与评测默认不访问 Hugging Face；检查时 cache 为空、现有 `127.0.0.1:1081` 代理不可用。准备阶段先探测届时可用的下载通道；若仍不可直连，则通过镜像或从其他机器迁入完整 snapshot。缓存 manifest 必须记录 repo ID、repo type、commit、文件清单和哈希。训练/评测阶段统一设置：
@@ -449,7 +449,7 @@ TRANSFORMERS_OFFLINE=1
 - 训练、验证和资源指标的 JSONL 或 Parquet；
 - 可选的 W&B/TensorBoard 同步，但本地结构化结果是强制项。
 
-默认启用 TensorBoard、关闭 W&B。所有路径解析到 `/data1/chenhang/SFT_Conflict/artifacts` 下的对应子目录，运行前执行磁盘容量预检。
+默认启用 TensorBoard、关闭 W&B。所有路径解析到 `<artifact-root>` 下的对应子目录，运行前执行磁盘容量预检。
 
 新配置中禁止出现 mask、WANDA/SNIP、probing、Sophia、unlearning、head/projection LoRA 和 two-stage alternating 字段。加载旧参考配置时必须由显式迁移工具生成新配置并报告被丢弃字段，主训练 CLI 不直接兼容旧参数。
 
@@ -1116,7 +1116,7 @@ SFT-Conflict/
 - 避免全词表 Token 对、完整胞腔和不必要的 $m\times m$ 矩阵；
 - 为参考模型在线前向、缓存读取、当前模型前向和几何损失分别计时；
 - 对 Anchor Token 数量、词表大小、随机 K 和缓存精度提供显存/存储估算器。
-- 每次正式运行前检查 `/data1` 可用容量；低于 2 TB 或不足预计新增量 2 倍时停止并反馈。
+- 每次正式运行前检查 artifact 根目录所在磁盘的可用容量；低于 2 TB 或不足预计新增量 2 倍时停止并反馈。
 
 ---
 
@@ -1126,7 +1126,7 @@ SFT-Conflict/
 
 | 输入资料 | 优先级 | 是否阻断 | 缺失时的处理方式 |
 |---|---|---|---|
-| GPU 与存储 | 已确认 | 不阻断 | 4×A100 40GB；Artifact 位于 `/data1/chenhang/SFT_Conflict/artifacts`，当前约 11 TB 可用 |
+| GPU 与存储 | 已确认 | 不阻断 | 4×A100 40GB；Artifact 位于 `<artifact-root>`，当前约 11 TB 可用 |
 | 模型与目标任务 | 已确认 | 不阻断 | Qwen2.5-0.5B 冒烟、3B 正式、7B 扩展；SST-2/GSM8K 冒烟，GSM8K 正式 |
 | Hugging Face cache | 路径与离线协议已确认，内容尚未准备 | 阻断真实模型/数据运行 | 通过可用下载通道或迁移方式填充固定 revision cache |
 | Future Localization Full FT/LoRA 蓝本 | 已提供完整 `src` 快照 | 不阻断 | 按第 4 节裁剪重构，不再等待额外训练模板 |
@@ -1166,7 +1166,7 @@ Geometric Lens 中目前可用于人工对照的范围是：
 
 #### 3. 已确认的服务器与训练资源
 
-当前服务器为单机最多 4×NVIDIA A100-SXM4-40GB，Driver 535.129.03，驱动报告 CUDA 12.2。`/data1` 当前约有 11 TB 可用空间，Artifact 根目录固定为 `/data1/chenhang/SFT_Conflict/artifacts`。未检测到可用 Hugging Face cache，且现有本地代理不可用；真实模型实验前需要先完成 cache 下载或迁入。未提供 Slurm 信息，因此首版按本机直接启动设计，同时保持 launch command 可迁移。
+当前服务器为单机最多 4×NVIDIA A100-SXM4-40GB，Driver 535.129.03，驱动报告 CUDA 12.2。数据盘当前约有 11 TB 可用空间，Artifact 根目录为 `<artifact-root>`。未检测到可用 Hugging Face cache，且现有本地代理不可用；真实模型实验前需要先完成 cache 下载或迁入。未提供 Slurm 信息，因此首版按本机直接启动设计，同时保持 launch command 可迁移。
 
 #### 4. 已确认的第一轮模型与任务
 

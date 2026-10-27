@@ -8,6 +8,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path, PurePosixPath
 
+from sft_conflict.paths import DEFAULT_ARTIFACT_ROOT
+
 
 class TrainingMode(str, Enum):
     FULL_FT = "full_ft"
@@ -32,6 +34,7 @@ class MethodName(str, Enum):
     CALIBRATE_LVD_PLUS_LAMBDA = "calibrate_lvd_plus_lambda"
     TARGET_PLUS_ANCHOR_CE_GEOMETRY = "target_plus_anchor_ce_geometry"
     PREPARE_ANCHOR_GEOMETRY_REFERENCE = "prepare_anchor_geometry_reference"
+    CREATE_ANCHOR_DATASET = "create_anchor_dataset"
 
     @classmethod
     def _missing_(cls, value: object) -> MethodName | None:
@@ -126,7 +129,7 @@ class LVDPlusObjectiveMode(str, Enum):
 
 @dataclass
 class PathsConfig:
-    artifact_root: str = "/data1/chenhang/SFT_Conflict/artifacts"
+    artifact_root: str = DEFAULT_ARTIFACT_ROOT
     run_name: str | None = None
     output_dir: str | None = None
     estimated_run_bytes: int = 0
@@ -626,12 +629,76 @@ class AnchorGeometryConfig:
     resolved_lambda: float | None = None
     calibrated_at_step: int | None = None
     calibration_sha256: str | None = None
+    # relative_band_v3: per-direction relative erosion tolerance, Huber scale in
+    # erosion units, Base-margin floor, and the coefficient calibration mode.
+    relative_tolerance: float = 0.5
+    relative_delta: float = 0.25
+    margin_floor: float = 1e-3
+    calibration_mode: str = "observed"
+    head_gradient_scale: float = 1.0
+    hidden_gradient_scale: float = 1.0
+    # Optional per-micro-batch cap on the geometry pull: the coefficient is scaled down
+    # whenever the objective's immediate hidden-gradient norm (with coefficient, per
+    # eligible position) would exceed pull_cap_ratio times the weighted Anchor CE
+    # immediate hidden-gradient norm (per supervised token), reduced over all ranks.
+    pull_cap_ratio: float | None = None
 
     def validate(self) -> None:
-        if type(self.config_version) is not int or self.config_version not in (1, 2):
-            raise ValueError("anchor_geometry.config_version must be the integer 1 or 2")
-        if self.objective != {1: "centered_v1", 2: "base_band_v2"}[self.config_version]:
+        if type(self.config_version) is not int or self.config_version not in (1, 2, 3):
+            raise ValueError("anchor_geometry.config_version must be the integer 1, 2 or 3")
+        objectives = {1: "centered_v1", 2: "base_band_v2", 3: "relative_band_v3"}
+        if self.objective != objectives[self.config_version]:
             raise ValueError("anchor_geometry objective must match config_version")
+        if self.calibration_mode not in ("observed", "saturated_slope", "nearest_direction_slope"):
+            raise ValueError(
+                "anchor_geometry.calibration_mode must be observed, saturated_slope or "
+                "nearest_direction_slope"
+            )
+        if self.calibration_mode != "observed" and self.objective != "relative_band_v3":
+            raise ValueError("surrogate calibration modes require the relative_band_v3 objective")
+        if (
+            isinstance(self.relative_tolerance, bool)
+            or not isinstance(self.relative_tolerance, int | float)
+            or not math.isfinite(self.relative_tolerance)
+            or not 0 <= self.relative_tolerance < 1
+        ):
+            raise ValueError("anchor_geometry.relative_tolerance must be in [0,1)")
+        if (
+            isinstance(self.head_gradient_scale, bool)
+            or not isinstance(self.head_gradient_scale, int | float)
+            or not math.isfinite(self.head_gradient_scale)
+            or not 0 <= self.head_gradient_scale <= 1
+        ):
+            raise ValueError("anchor_geometry.head_gradient_scale must be in [0,1]")
+        if self.head_gradient_scale != 1 and self.objective != "relative_band_v3":
+            raise ValueError(
+                "head_gradient_scale below one requires the relative_band_v3 objective"
+            )
+        if (
+            isinstance(self.hidden_gradient_scale, bool)
+            or not isinstance(self.hidden_gradient_scale, int | float)
+            or not math.isfinite(self.hidden_gradient_scale)
+            or not 0 <= self.hidden_gradient_scale <= 1
+        ):
+            raise ValueError("anchor_geometry.hidden_gradient_scale must be in [0,1]")
+        if self.hidden_gradient_scale != 1 and self.objective != "relative_band_v3":
+            raise ValueError(
+                "hidden_gradient_scale below one requires the relative_band_v3 objective"
+            )
+        if self.head_gradient_scale == 0 and self.hidden_gradient_scale == 0:
+            raise ValueError(
+                "anchor_geometry head_gradient_scale and hidden_gradient_scale cannot both be zero"
+            )
+        if self.pull_cap_ratio is not None:
+            if (
+                isinstance(self.pull_cap_ratio, bool)
+                or not isinstance(self.pull_cap_ratio, int | float)
+                or not math.isfinite(self.pull_cap_ratio)
+                or self.pull_cap_ratio <= 0
+            ):
+                raise ValueError("anchor_geometry.pull_cap_ratio must be positive or null")
+            if self.objective != "relative_band_v3":
+                raise ValueError("pull_cap_ratio requires the relative_band_v3 objective")
         for name in (
             "current_directions",
             "base_directions",
@@ -676,6 +743,8 @@ class AnchorGeometryConfig:
             "band_scale_ratio",
             "band_temperature",
             "band_min_calibration_rms",
+            "relative_delta",
+            "margin_floor",
         ):
             value = getattr(self, name)
             if (
@@ -751,6 +820,10 @@ class TrainingConfig:
     fsdp_keep_low_precision_params: bool = False
     report_to: tuple[str, ...] = ("tensorboard",)
     resume_from_checkpoint: str | None = None
+    # Which per-epoch validation metric picks the checkpoint loaded at the end of
+    # training: the token-level evaluation loss, or the task-native classification
+    # accuracy (candidate log-likelihoods) on the same training validation split.
+    best_model_metric: str = "eval_loss"
 
 
 @dataclass
@@ -867,6 +940,7 @@ class ExperimentConfig:
             MethodName.TARGET_PLUS_ANCHOR_LVD_PLUS,
             MethodName.TARGET_PLUS_ANCHOR_CE_GEOMETRY,
             MethodName.FILTERING_ANCHOR,
+            MethodName.CREATE_ANCHOR_DATASET,
             MethodName.RECORD_ANCHOR_D0,
             MethodName.TEST_INTERFERENCE,
             MethodName.TEST_CROSSING,
@@ -982,6 +1056,8 @@ class ExperimentConfig:
 
         if self.training.mixed_precision not in {"bf16", "fp16", "fp32"}:
             raise ValueError("training.mixed_precision must be bf16, fp16, or fp32")
+        if self.training.best_model_metric not in {"eval_loss", "native_accuracy"}:
+            raise ValueError("training.best_model_metric must be eval_loss or native_accuracy")
         if self.training.optimizer not in {"adamw_torch", "adamw_bnb_8bit", "adafactor"}:
             raise ValueError("training.optimizer must be adamw_torch, adamw_bnb_8bit, or adafactor")
         if self.training.learning_rate <= 0:

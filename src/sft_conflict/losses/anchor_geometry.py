@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+
 import torch
 import torch.distributed as distributed
 from torch import Tensor
@@ -13,7 +15,9 @@ from sft_conflict.geometry.dynamic import (
     base_conditioned_band_widths,
     chunked_centered_huber_rows,
     dynamic_competitors,
+    immediate_hidden_gradients,
     normalized_margins,
+    relative_margin_gradients,
 )
 
 from .base import LossContext, LossResult
@@ -42,6 +46,9 @@ class AnchorGeometryLoss:
         self.reference = reference
         self.calibrating = False
         self.max_frequency = int(reference.frequencies.max())
+        # Weight of the Anchor CE term this auxiliary accompanies (set by the plugin
+        # builder); only used to express the immediate-gradient diagnostic ratio.
+        self.anchor_weight = 1.0
 
     def _band_widths(self, record, column: int, label: int, ids: Tensor) -> Tensor:
         initial_hidden = record["hidden"][column : column + 1]
@@ -78,6 +85,58 @@ class AnchorGeometryLoss:
             epsilon=self.config.hidden_epsilon,
         )[0]
 
+    @torch.no_grad()
+    def _immediate_hidden_statistics(
+        self,
+        weight: Tensor,
+        logits: Tensor,
+        positions: Tensor,
+        mask: Tensor,
+        labels: Tensor,
+        selected_hidden: Tensor,
+        live_weight: Tensor,
+        local_ids: Tensor,
+        margins: Tensor,
+        reference_values: Tensor,
+        weights: Tensor,
+    ) -> tuple[Tensor, Tensor, int, int]:
+        """Squared immediate hidden-gradient norms (before the model Jacobian).
+
+        Geometry: the relative objective's per-position rows on the eligible positions;
+        Anchor CE: unit-weight token CE on every supervised Anchor token of this batch.
+        Both exclude their mean normalisation, which the caller applies.
+        """
+        margin_gradient = relative_margin_gradients(
+            margins,
+            reference_values,
+            weights,
+            tolerance=self.config.relative_tolerance,
+            delta=self.config.relative_delta,
+            floor=self.config.margin_floor,
+        )
+        geometry_gradients = immediate_hidden_gradients(
+            selected_hidden.detach(),
+            live_weight.detach(),
+            local_ids[:, 0],
+            local_ids[:, 1:],
+            margin_gradient,
+            normal_epsilon=self.config.normal_epsilon,
+            hidden_epsilon=self.config.hidden_epsilon,
+            position_chunk_size=self.config.position_chunk_size,
+        )
+        batch_rows = torch.arange(positions.shape[0], device=positions.device)[:, None]
+        rows = batch_rows.expand_as(positions)
+        token_logits = logits.detach()[rows[mask], positions[mask]].float()
+        token_labels = labels[mask]
+        full_weight = weight.detach().float()
+        ce_gradients = torch.softmax(token_logits, dim=-1) @ full_weight - full_weight[token_labels]
+        return (
+            geometry_gradients.float().square().sum(),
+            ce_gradients.square().sum(),
+            len(selected_hidden),
+            int(token_labels.numel()),
+        )
+
     def coefficient(self, step: int) -> float:
         if step < self.config.geometry_start_step:
             return 0.0
@@ -99,20 +158,25 @@ class AnchorGeometryLoss:
             return LossResult(zero, {"geometry/lambda": 0.0, "geometry/active": 0.0})
         error = None
         rows, common, counts = [], [], {}
+        immediate = torch.zeros(4, dtype=torch.float64, device=logits.device)
         band_mode = self.config.objective == "base_band_v2"
-        band_statistics = (
-            dict.fromkeys(
-                (
-                    "geometry/band_width_mean",
-                    "geometry/band_log_width_ratio_mean",
-                    "geometry/band_center_mean",
-                    "geometry/band_active_rate",
-                ),
-                zero.detach(),
+        relative_mode = self.config.objective == "relative_band_v3"
+        if band_mode:
+            statistic_names = (
+                "geometry/band_width_mean",
+                "geometry/band_log_width_ratio_mean",
+                "geometry/band_center_mean",
+                "geometry/band_active_rate",
             )
-            if band_mode
-            else {}
-        )
+        elif relative_mode:
+            statistic_names = (
+                "geometry/relative_erosion_mean",
+                "geometry/relative_excess_mean",
+                "geometry/relative_active_rate",
+            )
+        else:
+            statistic_names = ()
+        band_statistics = dict.fromkeys(statistic_names, zero.detach())
         try:
             positions, mask, labels = context.anchor_label_selection()
             batch = context.stream_batch("anchor")
@@ -259,9 +323,64 @@ class AnchorGeometryLoss:
                     position_chunk_size=self.config.position_chunk_size,
                     widths=band_widths,
                     solver_iterations=self.config.band_solver_iterations,
+                    relative=(
+                        {
+                            "tolerance": self.config.relative_tolerance,
+                            "delta": self.config.relative_delta,
+                            "floor": self.config.margin_floor,
+                            "surrogate": (
+                                {
+                                    "saturated_slope": "all",
+                                    "nearest_direction_slope": "nearest",
+                                }.get(self.config.calibration_mode)
+                                if self.calibrating
+                                else None
+                            ),
+                        }
+                        if relative_mode
+                        else None
+                    ),
+                    head_gradient_scale=(self.config.head_gradient_scale if relative_mode else 1.0),
+                    hidden_gradient_scale=(
+                        self.config.hidden_gradient_scale if relative_mode else 1.0
+                    ),
                 )
                 rows.append(values)
-                if band_mode:
+                if relative_mode:
+                    signed_drift = margins.detach() - reference_values
+                    common.append((signed_drift * weights).sum(dim=-1))
+                    valid = weights > 0
+                    erosion = -signed_drift / reference_values.clamp_min(self.config.margin_floor)
+                    excess = (erosion - self.config.relative_tolerance).clamp_min(0)
+                    band_statistics["geometry/relative_erosion_mean"] = (erosion * weights).sum()
+                    band_statistics["geometry/relative_excess_mean"] = (excess * weights).sum()
+                    band_statistics["geometry/relative_active_rate"] = ((excess > 0) & valid).sum()
+                    geometry_sq, ce_sq, eligible, supervised = self._immediate_hidden_statistics(
+                        weight,
+                        logits,
+                        positions,
+                        mask,
+                        labels,
+                        selected_hidden,
+                        live_weight,
+                        local_ids,
+                        margins,
+                        reference_values,
+                        weights,
+                    )
+                    immediate = torch.stack(
+                        [
+                            geometry_sq.double(),
+                            ce_sq.double(),
+                            torch.tensor(
+                                float(eligible), dtype=torch.float64, device=geometry_sq.device
+                            ),
+                            torch.tensor(
+                                float(supervised), dtype=torch.float64, device=geometry_sq.device
+                            ),
+                        ]
+                    ).to(logits.device)
+                elif band_mode:
                     signed_drift = margins.detach() - reference_values
                     common.append((signed_drift * weights).sum(dim=-1))
                     valid = weights > 0
@@ -282,6 +401,31 @@ class AnchorGeometryLoss:
         except (ValueError, RuntimeError, KeyError, IndexError) as exc:
             error = exc
         _collective_geometry_error(error, logits.device)
+        coefficient = 1.0 if self.calibrating else self.coefficient(context.global_step)
+        immediate_ratio, cap_active = 0.0, 0.0
+        if relative_mode:
+            # Global (all-rank) immediate pull ratio; every rank participates, also those
+            # without eligible positions, so the cap is identical across ranks.
+            if distributed.is_available() and distributed.is_initialized():
+                distributed.all_reduce(immediate, op=distributed.ReduceOp.SUM)
+            geometry_sq, ce_sq, eligible, supervised = immediate.tolist()
+            geometry_norm = coefficient * math.sqrt(geometry_sq) / max(eligible, 1.0)
+            ce_norm = self.anchor_weight * math.sqrt(ce_sq) / max(supervised, 1.0)
+            immediate_ratio = geometry_norm / ce_norm if ce_norm > 0 else 0.0
+            cap = self.config.pull_cap_ratio
+            if (
+                cap is not None
+                and not self.calibrating
+                and immediate_ratio > cap
+                and math.isfinite(immediate_ratio)
+            ):
+                coefficient *= cap / immediate_ratio
+                immediate_ratio = cap
+                cap_active = 1.0
+            counts["geometry/immediate_geometry_hidden_sq"] = coefficient**2 * float(immediate[0])
+            counts["geometry/immediate_anchor_ce_hidden_sq"] = self.anchor_weight**2 * float(
+                immediate[1]
+            )
         local_rows = torch.cat(rows) if rows else zero.expand(0)
         raw = (
             distributed_global_mean(
@@ -312,18 +456,19 @@ class AnchorGeometryLoss:
         denominators.update({name: len(local_rows) for name in band_statistics})
         if band_mode:
             denominators["geometry/band_active_rate"] = counts["geometry/valid_pair_count"]
-        coefficient = 1.0 if self.calibrating else self.coefficient(context.global_step)
-        return LossResult(
-            raw * coefficient,
-            {
-                "loss/anchor_geometry_raw": raw.detach(),
-                "geometry/lambda": coefficient,
-                "geometry/active": 1.0,
-            },
-            numerators,
-            denominators,
-            counts,
-        )
+        if relative_mode:
+            denominators["geometry/relative_active_rate"] = counts["geometry/valid_pair_count"]
+        metrics = {
+            "loss/anchor_geometry_raw": raw.detach(),
+            "geometry/lambda": coefficient,
+            "geometry/active": 1.0,
+        }
+        if relative_mode:
+            # Global ratio of the geometry's immediate hidden gradient (with its effective
+            # coefficient and 1/N mean) to the weighted Anchor CE token-mean gradient.
+            metrics["geometry/immediate_hidden_ratio"] = immediate_ratio
+            metrics["geometry/pull_cap_active"] = cap_active
+        return LossResult(raw * coefficient, metrics, numerators, denominators, counts)
 
     def __call__(self, context: LossContext) -> LossResult:
         if context.stream_batch("anchor") is None:

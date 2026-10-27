@@ -37,6 +37,21 @@ def _gather(value):
 
 def geometry_recipe(trainer) -> str:
     options = asdict(trainer.anchor_geometry_config)
+    if options["objective"] != "relative_band_v3":
+        # Keep historical recipe hashes stable: v3-only settings never enter them.
+        options = {
+            name: value
+            for name, value in options.items()
+            if not name.startswith("relative_")
+            and name
+            not in (
+                "margin_floor",
+                "calibration_mode",
+                "head_gradient_scale",
+                "hidden_gradient_scale",
+                "pull_cap_ratio",
+            )
+        }
     if options["objective"] == "centered_v1":
         options = {
             name: value
@@ -271,7 +286,10 @@ def calibrate_anchor_geometry(trainer) -> dict:
     )
     if not math.isfinite(rms) or rms <= 0:
         raise RuntimeError("geometry calibration has zero effective gradient; cannot normalize")
-    if config.objective == "base_band_v2" and rms < config.band_min_calibration_rms:
+    if (
+        config.objective in ("base_band_v2", "relative_band_v3")
+        and rms < config.band_min_calibration_rms
+    ):
         raise RuntimeError(
             "band geometry calibration gradient is too small; inspect active-band rates "
             "and width settings instead of amplifying a near-zero gradient"
@@ -365,7 +383,10 @@ def validate_calibration_report(trainer, report: dict) -> None:
     )
     if not math.isfinite(rms) or rms <= 0:
         raise ValueError("geometry calibration report has zero effective RMS")
-    if config.objective == "base_band_v2" and rms < config.band_min_calibration_rms:
+    if (
+        config.objective in ("base_band_v2", "relative_band_v3")
+        and rms < config.band_min_calibration_rms
+    ):
         raise ValueError("band geometry calibration report has a near-zero effective RMS")
     for name, expected in (
         ("rms_ratio", rms),

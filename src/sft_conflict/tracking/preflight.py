@@ -119,9 +119,10 @@ def _loss_plan(config: ExperimentConfig) -> list[dict[str, Any]]:
         losses.append(
             {
                 "dataset_role": "anchor",
-                "loss": "BaseConditionedBandHuber"
-                if geometry.objective == "base_band_v2"
-                else "CenteredDynamicMarginHuber",
+                "loss": {
+                    "base_band_v2": "BaseConditionedBandHuber",
+                    "relative_band_v3": "RelativeErosionHuber",
+                }.get(geometry.objective, "CenteredDynamicMarginHuber"),
                 "objective": geometry.objective,
                 "weight": geometry.resolved_lambda
                 if geometry.resolved_lambda is not None
@@ -158,6 +159,20 @@ def _loss_plan(config: ExperimentConfig) -> list[dict[str, Any]]:
                         }
                     }
                     if geometry.objective == "base_band_v2"
+                    else {
+                        "relative_rule": {
+                            "erosion": "(base_margin - current_margin) / max(base_margin, floor)",
+                            "tolerance": geometry.relative_tolerance,
+                            "huber_delta": geometry.relative_delta,
+                            "floor": geometry.margin_floor,
+                            "one_sided": "margin increases are never penalised",
+                            "calibration": geometry.calibration_mode,
+                            "head_gradient_scale": geometry.head_gradient_scale,
+                            "hidden_gradient_scale": geometry.hidden_gradient_scale,
+                            "pull_cap_ratio": geometry.pull_cap_ratio,
+                        }
+                    }
+                    if geometry.objective == "relative_band_v3"
                     else {}
                 ),
             }

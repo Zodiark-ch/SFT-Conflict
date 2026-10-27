@@ -27,9 +27,9 @@ API boundaries, experimental protocols, and tests.
 - Files with an Apache-2.0 marker in their header: 0
 
 No `NOTICE` file was present in the supplied snapshots. Per-file hashes and the exact list of files
-with Apache-2.0 markers are stored outside Git under
-`/data1/chenhang/SFT_Conflict/artifacts/reference_cache/manifests/`. The tracked aggregate manifest
-is [docs/reference-snapshots.json](docs/reference-snapshots.json).
+with Apache-2.0 markers are stored outside Git under `<artifact-root>/reference_cache/manifests/`;
+the aggregate manifest (`docs/reference-snapshots.json`) is kept with the unpublished development
+notes.
 
 If source is copied from a reference snapshot later, its original copyright and license header must
 be retained, and this notice must be updated with the source URL, immutable revision, and file

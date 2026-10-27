@@ -92,6 +92,21 @@ class Evaluator(ABC):
 class ClassificationEvaluator(Evaluator, ABC):
     """Marker base class for finite-label conditional-likelihood tasks."""
 
+    def candidate_responses(self) -> tuple[str, ...]:
+        """Fixed candidate completions scored for every prompt (selection support)."""
+        raise NotImplementedError(f"{type(self).__name__} has no fixed candidate set")
+
+    def gold_index(self, example) -> int:
+        """Index of the gold candidate for one logical example (selection support)."""
+        raise NotImplementedError(f"{type(self).__name__} has no gold candidate index")
+
+    def supports_selection(self) -> bool:
+        try:
+            self.candidate_responses()
+        except NotImplementedError:
+            return False
+        return True
+
 
 class GenerationEvaluator(Evaluator, ABC):
     """Marker base class for deterministic free-generation tasks."""
@@ -202,6 +217,7 @@ def _score_completion_candidates(
     responses: tuple[str, ...],
     *,
     max_input_length: int,
+    inference_mode: bool = True,
 ) -> list[list[float]]:
     texts: list[str] = []
     boundaries: list[int] = []
@@ -239,7 +255,9 @@ def _score_completion_candidates(
     }
     targets = input_ids[:, 1:].to(device)
     selected = completion_mask[:, 1:].to(device)
-    with torch.inference_mode():
+    # FSDP-wrapped models are scored under no_grad: inference tensors would not
+    # survive the sharded parameter views.
+    with torch.inference_mode() if inference_mode else torch.no_grad():
         logits = model(**model_inputs, use_cache=False).logits[:, :-1, :]
         selected_logits = logits[selected].float()
     del logits
@@ -289,6 +307,12 @@ def _validated_result(
 
 class SST2Evaluator(ClassificationEvaluator):
     RESPONSES = (" negative", " positive")
+
+    def candidate_responses(self) -> tuple[str, ...]:
+        return self.RESPONSES
+
+    def gold_index(self, example) -> int:
+        return int(example.source_metadata["gold_label"])
 
     def __init__(self, *, max_input_length: int = 512) -> None:
         super().__init__(
@@ -374,6 +398,12 @@ class GLUEClassificationEvaluator(ClassificationEvaluator):
             )
         )
 
+    def candidate_responses(self) -> tuple[str, ...]:
+        return tuple(f" {label}" for label in self.task_spec.label_texts)
+
+    def gold_index(self, example) -> int:
+        return int(example.source_metadata["gold_label"])
+
     def evaluate(
         self,
         model,
@@ -383,7 +413,7 @@ class GLUEClassificationEvaluator(ClassificationEvaluator):
         batch_size: int,
     ) -> EvaluationResult:
         samples: list[dict[str, Any]] = []
-        responses = tuple(f" {label}" for label in self.task_spec.label_texts)
+        responses = self.candidate_responses()
         was_training = model.training
         model.eval()
         try:
@@ -441,6 +471,57 @@ class GLUEClassificationEvaluator(ClassificationEvaluator):
             },
             samples=tuple(samples),
         )
+
+
+def sharded_classification_counts(
+    evaluator: ClassificationEvaluator,
+    model,
+    tokenizer,
+    dataset: LogicalDataset,
+    *,
+    batch_size: int,
+    rank: int = 0,
+    world_size: int = 1,
+    inference_mode: bool = True,
+) -> tuple[int, int]:
+    """(correct, total) over this rank's contiguous shard of a classification dataset.
+
+    Every rank issues exactly the same number of forward passes (short shards repeat
+    their last prompt and discard the duplicate scores), so the call is safe inside a
+    collective-synchronised model such as FSDP. Summing the pairs over ranks gives the
+    dataset-level counts.
+    """
+    if batch_size <= 0:
+        raise ValueError("evaluation batch_size must be positive")
+    if world_size <= 0 or not 0 <= rank < world_size:
+        raise ValueError("rank must lie inside the world size")
+    responses = evaluator.candidate_responses()
+    examples = list(dataset)
+    per_rank = math.ceil(len(examples) / world_size)
+    shard = examples[rank * per_rank : (rank + 1) * per_rank]
+    batches = math.ceil(per_rank / batch_size)
+    filler = shard[-1] if shard else examples[-1]
+    correct = total = 0
+    for batch_index in range(batches):
+        chunk = shard[batch_index * batch_size : (batch_index + 1) * batch_size]
+        real = len(chunk)
+        if real < batch_size and (batch_index + 1) * batch_size <= per_rank:
+            chunk = chunk + [filler] * (batch_size - real)
+        elif real == 0:
+            chunk = [filler]
+        score_rows = _score_completion_candidates(
+            model,
+            tokenizer,
+            [example.prompt for example in chunk],
+            responses,
+            max_input_length=evaluator.protocol.max_input_length,
+            inference_mode=inference_mode,
+        )
+        for example, scores in list(zip(chunk, score_rows, strict=True))[:real]:
+            prediction = max(range(len(scores)), key=scores.__getitem__)
+            correct += int(prediction == evaluator.gold_index(example))
+            total += 1
+    return correct, total
 
 
 _NUMBER_PATTERN = re.compile(r"[-+]?\d[\d,]*(?:\.\d+)?")
