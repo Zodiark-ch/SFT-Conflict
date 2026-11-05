@@ -1,6 +1,7 @@
 # Unifying and Beyond the Theory of Pervasive Capability Degradation in LLM Post-training SFT from Feature Interference
 
-Code for the paper above. The paper is not on arXiv yet; citation information will be added here.
+Code for the paper above ([arXiv:2611.05003](https://arxiv.org/abs/2611.05003)). See
+[Citation](#citation) for how to cite it.
 
 ## Introduction
 
@@ -164,6 +165,20 @@ samples and tasks, the covered vocabulary and the Base model's accuracy. To use 
 | `--geometry-config` | AEGIS configuration (`configs/method/anchor_ce_geometry_relative.yaml`) |
 | `--set NAME=VALUE` | override any other default defined in `run.py` |
 | `--dry-run` | print the resolved command without running it |
+
+## Citation
+
+```bibtex
+@misc{chen2026unifyingtheorypervasivecapability,
+      title={Unifying and Beyond the Theory of Pervasive Capability Degradation in LLM Post-training SFT from Feature Interference},
+      author={Hang Chen and Jiaying Zhu and Wenya Wang},
+      year={2026},
+      eprint={2611.05003},
+      archivePrefix={arXiv},
+      primaryClass={cs.LG},
+      url={https://arxiv.org/abs/2611.05003},
+}
+```
 
 ## Acknowledgements
 
